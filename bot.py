@@ -23,7 +23,7 @@ import shutil
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -255,13 +255,17 @@ def fetch_transcript(video_id: str) -> str:
     return "\n".join(lines)
 
 
-def fetch_comments(video_url: str) -> list[dict[str, Any]]:
-    """Fetch every comment and reply, sorted by popularity."""
+def fetch_comments(video_url: str, limit: int | None = None) -> list[dict[str, Any]]:
+    """Fetch YouTube comments sorted by popularity.
+
+    ``limit=None`` uses the global MAX_COMMENTS setting; ``0`` means unlimited.
+    """
+    cap = MAX_COMMENTS if limit is None else limit
     downloader = YoutubeCommentDownloader()
     comments: list[dict[str, Any]] = []
     for comment in downloader.get_comments_from_url(video_url, sort_by=SORT_BY_POPULAR):
         comments.append(comment)
-        if MAX_COMMENTS and len(comments) >= MAX_COMMENTS:
+        if cap and len(comments) >= cap:
             break
     return comments
 
@@ -424,6 +428,9 @@ class ChannelItem:
     tags: list[str]
     collaborations: str
     description: str
+    # Filled by the cloud batch runner (channel mode keeps them empty locally).
+    transcript: str = ""
+    comments: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -932,6 +939,44 @@ def fetch_channel_listing(
     return info, entries
 
 
+def build_channel_item(
+    source: dict[str, Any],
+    kind: str,
+    *,
+    own_handles: tuple[str, ...] = (),
+    collaboration_source: dict[str, Any] | None = None,
+    video_id: str | None = None,
+) -> ChannelItem:
+    """Build one ChannelItem row from yt-dlp info (or a flat playlist entry)."""
+    resolved_id = str(video_id or source.get("id") or "")
+    title = str(source.get("title") or "Untitled")
+    description = str(source.get("description") or "")
+    url = (
+        f"https://www.youtube.com/shorts/{resolved_id}"
+        if kind == "Short"
+        else str(source.get("webpage_url") or f"https://www.youtube.com/watch?v={resolved_id}")
+    )
+    return ChannelItem(
+        kind=kind,
+        title=title,
+        url=url,
+        upload_date=_iso_upload_date(source),
+        views=_as_int(source.get("view_count")),
+        likes=_as_int(source.get("like_count")),
+        comment_count=_as_int(source.get("comment_count")),
+        duration_sec=_as_int(source.get("duration")),
+        category=", ".join(source.get("categories") or []) if kind == "Video" else "",
+        tags=[str(tag) for tag in (source.get("tags") or [])],
+        collaborations=detect_collaborations(
+            collaboration_source,
+            title=title,
+            description=description,
+            own_handles=own_handles,
+        ),
+        description=description,
+    )
+
+
 def fetch_items_with_details(
     entries: list[dict[str, Any]],
     kind: str,
@@ -956,37 +1001,17 @@ def fetch_items_with_details(
             except Exception as exc:
                 logger.warning("Could not fetch details for %s: %s", video_id, exc)
             source = info if isinstance(info, dict) else entry
-            title = str(source.get("title") or "Untitled")
-            description = str(source.get("description") or "")
-            url = (
-                f"https://www.youtube.com/shorts/{video_id}"
-                if kind == "Short"
-                else str(
-                    source.get("webpage_url") or f"https://www.youtube.com/watch?v={video_id}"
-                )
-            )
             items.append(
-                ChannelItem(
-                    kind=kind,
-                    title=title,
-                    url=url,
-                    upload_date=_iso_upload_date(source),
-                    views=_as_int(source.get("view_count")),
-                    likes=_as_int(source.get("like_count")),
-                    comment_count=_as_int(source.get("comment_count")),
-                    duration_sec=_as_int(source.get("duration")),
-                    category=", ".join(source.get("categories") or []) if kind == "Video" else "",
-                    tags=[str(tag) for tag in (source.get("tags") or [])],
-                    collaborations=detect_collaborations(
-                        source if info else None,
-                        title=title,
-                        description=description,
-                        own_handles=own_handles,
-                    ),
-                    description=description,
+                build_channel_item(
+                    source,
+                    kind,
+                    own_handles=own_handles,
+                    collaboration_source=source if info else None,
+                    video_id=video_id,
                 )
             )
-            label = title if len(title) <= 45 else title[:44] + "…"
+            label_title = str(source.get("title") or "Untitled")
+            label = label_title if len(label_title) <= 45 else label_title[:44] + "…"
             note(f"Inspected {kind.lower()} {index}/{len(entries)}: {label}")
     return items
 
@@ -1764,16 +1789,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• Video / Shorts → thumbnail + Markdown file with metadata, description, "
         "transcript and every comment.\n"
         "• Channel → avatar + Excel Channel Intelligence workbook + Markdown SEO audit.\n"
-        "• /batch + channel links (or paste 2+ channel links) → dispatch the batch to "
-        "GitHub Actions, then shut your laptop down: the cloud runner posts live "
-        "progress and the final Excel/ZIP right here in this chat.\n\n"
+        "• /batch + ANY mix of channel and video links (or paste 2+ links) → runs the "
+        "whole batch in the cloud on GitHub Actions, then shut your laptop down: live "
+        "Thinking updates + categorized Excel/Markdown/ZIP arrive right here.\n\n"
         "Examples:\n"
         "• https://www.youtube.com/watch?v=dQw4w9WgXcQ\n"
         "• https://youtu.be/dQw4w9WgXcQ\n"
         "• https://www.youtube.com/shorts/dQw4w9WgXcQ\n"
         "• https://www.youtube.com/@MrBeast\n"
         "• https://www.youtube.com/channel/UCX6OQ3DkcsbYNE6H8uQQuVA\n"
-        "• /batch https://www.youtube.com/@MrBeast https://www.youtube.com/@mkbhd"
+        "• /batch https://www.youtube.com/@MrBeast https://youtu.be/dQw4w9WgXcQ"
     )
 
 
@@ -1784,7 +1809,7 @@ HINT_TEXT = (
     "• https://www.youtube.com/shorts/dQw4w9WgXcQ\n"
     "• https://www.youtube.com/@MrBeast\n"
     "• https://www.youtube.com/channel/UCX6OQ3DkcsbYNE6H8uQQuVA\n\n"
-    "Cloud batch: /batch followed by channel links, or paste 2+ channel links in one message."
+    "Cloud batch: /batch followed by any mix of channel + video links, or paste 2+ links."
 )
 
 
@@ -1802,6 +1827,20 @@ def extract_channel_urls(text: str) -> list[str]:
         seen.add(key)
         urls.append(base)
     return urls
+
+
+def extract_batch_links(text: str) -> tuple[list[str], list[str]]:
+    """Split a message into (channel URLs, standalone video URLs), deduplicated."""
+    channels = extract_channel_urls(text)
+    videos: list[str] = []
+    seen_ids: set[str] = set()
+    for token in (text or "").split():
+        video_id = extract_video_id(token)
+        if not video_id or video_id in seen_ids:
+            continue
+        seen_ids.add(video_id)
+        videos.append(f"https://www.youtube.com/watch?v={video_id}")
+    return channels, videos
 
 
 def channel_label(url: str) -> str:
@@ -1822,17 +1861,17 @@ async def handle_youtube_link(update: Update, context: ContextTypes.DEFAULT_TYPE
     if message is None or not message.text:
         return
 
-    video_id = extract_video_id(message.text)
+    channels, videos = extract_batch_links(message.text)
+    if len(channels) + len(videos) >= 2:
+        await _handle_cloud_batch(message, channels, videos)
+        return
+
+    video_id = extract_video_id(videos[0]) if videos else None
     if video_id:
         await process_video(message, video_id)
         return
-
-    channel_urls = extract_channel_urls(message.text)
-    if len(channel_urls) >= 2:
-        await _handle_cloud_batch(message, channel_urls)
-        return
-    if channel_urls:
-        await process_channel(message, channel_urls[0])
+    if channels:
+        await process_channel(message, channels[0])
         return
 
     await message.reply_text(HINT_TEXT)
@@ -2059,7 +2098,7 @@ def cloud_batch_config() -> tuple[str, str, str]:
     return pat, repo, branch
 
 
-def dispatch_github_batch(channels: list[str], chat_id: int | str) -> tuple[bool, str]:
+def dispatch_github_batch(links: list[str], chat_id: int | str) -> tuple[bool, str]:
     """Trigger the cloud workflow via the GitHub Actions dispatch API."""
     pat, repo, branch = cloud_batch_config()
     if not pat or not repo:
@@ -2074,7 +2113,7 @@ def dispatch_github_batch(channels: list[str], chat_id: int | str) -> tuple[bool
     payload = {
         "ref": branch,
         "inputs": {
-            "extra_channels": "\n".join(channels),
+            "extra_channels": "\n".join(links),
             "chat_id": str(chat_id),
         },
     }
@@ -2090,7 +2129,7 @@ def dispatch_github_batch(channels: list[str], chat_id: int | str) -> tuple[bool
         return False, f"GitHub API unreachable: {str(exc)[:200]}"
     if response.status_code in (201, 204):
         return True, (
-            f"Workflow dispatched to {repo} ({branch}) for {len(channels)} channel(s)"
+            f"Workflow dispatched to {repo} ({branch}) for {len(links)} link(s)"
         )
     detail = ""
     try:
@@ -2100,12 +2139,15 @@ def dispatch_github_batch(channels: list[str], chat_id: int | str) -> tuple[bool
     return False, f"GitHub API returned {response.status_code}: {detail[:200]}"
 
 
-async def _handle_cloud_batch(message: Message, channels: list[str]) -> None:
+async def _handle_cloud_batch(
+    message: Message, channels: list[str], videos: list[str]
+) -> None:
+    links = channels + videos
     card = ProgressCard(
         title="🚀 Cloud Batch — GitHub Actions",
         steps=[
             "Message Received",
-            "Validating Channel Links",
+            "Validating Links",
             "Dispatching to GitHub Actions",
             "Handoff Complete",
         ],
@@ -2113,43 +2155,46 @@ async def _handle_cloud_batch(message: Message, channels: list[str]) -> None:
     card.finish_step(0)
     card.start_step(1)
     card.set_state("🚀 Preparing cloud batch…")
-    card.add_trace(f"Received {len(channels)} channel link(s) from Telegram")
+    card.add_trace(
+        f"Received {len(channels)} channel link(s) and {len(videos)} standalone video(s)"
+    )
     status = await message.reply_text(
         card.render(), parse_mode="HTML", disable_web_page_preview=True
     )
     live = LiveStatus(status, card)
 
-    if not channels:
+    if not links:
         card.fail_step(1)
         card.set_state("⚠️ Nothing to dispatch")
         card.add_trace(
-            "No channel links found. Send /batch followed by channel URLs, or paste "
-            "2+ channel links in one message."
+            "No links found. Send /batch followed by channel and/or video URLs, or paste "
+            "2+ links in one message."
         )
         await live.edit(force=True)
         return
 
-    labels = ", ".join(channel_label(url) for url in channels[:8])
-    card.add_trace(f"Validated: {labels}")
+    labels = [channel_label(url) for url in channels[:6]]
+    labels += [f"video {extract_video_id(url) or url}" for url in videos[:6]]
+    card.add_trace("Validated: " + ", ".join(labels))
     card.finish_step(1)
     card.start_step(2)
     card.set_state("☁️ Dispatching to GitHub Actions…")
     await live.edit(force=True)
 
-    ok, detail = await asyncio.to_thread(
-        dispatch_github_batch, channels, message.chat_id
-    )
+    ok, detail = await asyncio.to_thread(dispatch_github_batch, links, message.chat_id)
     card.add_trace(detail)
     if ok:
         card.finish_step(2)
         card.finish_step(3)
         card.set_state(
-            f"✅ Cloud batch dispatched · {len(channels)} channel(s) · {card.elapsed_text()}"
+            f"✅ Cloud batch dispatched · {len(channels)} channels + "
+            f"{len(videos)} videos · {card.elapsed_text()}"
         )
         card.footer = (
-            f"🚀 Cloud Batch Dispatched to GitHub Actions for {len(channels)} channels! "
-            "You can safely shut down your laptop now — live progress & final categorized "
-            "Excel/ZIP will appear right here on your phone."
+            f"🚀 Cloud Batch Dispatched to GitHub Actions ({len(channels)} channels, "
+            f"{len(videos)} standalone videos)! You can safely shut down your laptop now — "
+            "live Thinking updates & final categorized Excel/Markdown/ZIP will arrive right "
+            "here on your phone."
         )
         card.add_trace(
             "Cloud runner will post the live thinking card + master workbook + ZIP."
@@ -2168,10 +2213,10 @@ async def cmd_batch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = message.text or ""
     if text.lower().startswith("/batch"):
         text = text[len("/batch"):]
-    channels = extract_channel_urls(text)
-    if not channels and context.args:
-        channels = extract_channel_urls(" ".join(context.args))
-    await _handle_cloud_batch(message, channels)
+    channels, videos = extract_batch_links(text)
+    if not channels and not videos and context.args:
+        channels, videos = extract_batch_links(" ".join(context.args))
+    await _handle_cloud_batch(message, channels, videos)
 
 
 # --------------------------------------------------------------------------- #
