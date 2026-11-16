@@ -1,0 +1,21 @@
+# --- Secrets -----------------------------------------------------------------
+.env
+!.env.example
+
+# --- Generated artefacts (never commit scraped output) -----------------------
+output/
+*.xlsx
+*.zip
+*.jpg
+*.md
+!README.md
+
+# --- Python ------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.log
+.DS_Store
+
+# --- Local scratch -----------------------------------------------------------
+staging/
