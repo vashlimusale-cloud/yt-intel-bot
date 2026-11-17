@@ -589,6 +589,10 @@ def audit_channel_full(url: str, ui: LiveBatchUI) -> FullChannel:
     listing, video_entries = yt_bot.fetch_channel_listing(
         base_url, "videos", MAX_CHANNEL_VIDEOS
     )
+    if listing.get("_fallback") and not video_entries:
+        raise yt_bot.DatacenterBlockError(
+            "YouTube channel listing blocked from this runner IP"
+        )
     resolved_url = yt_bot._resolve_channel_base(base_url, listing)
     about_data = yt_bot.fetch_channel_about(resolved_url)
     profile = yt_bot.build_channel_profile(resolved_url, listing, about_data)

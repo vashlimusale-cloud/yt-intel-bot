@@ -186,18 +186,282 @@ def _fmt_upload_date(info: dict[str, Any]) -> str:
 # --------------------------------------------------------------------------- #
 # Scraping (all of this runs in a worker thread)
 # --------------------------------------------------------------------------- #
-def fetch_metadata(url: str) -> dict[str, Any]:
-    """Fetch full video metadata with yt-dlp without downloading the video."""
-    options = {
+# --------------------------------------------------------------------------- #
+# Datacenter-safe extraction: multi-client yt-dlp + oEmbed / HTML fallback
+# --------------------------------------------------------------------------- #
+RESILIENT_PLAYER_CLIENTS = ["tv_embedded", "android_vr", "ios", "mweb", "web"]
+DATACENTER_BLOCK_MARKERS = (
+    "failed to extract any player response",
+    "sign in to confirm",
+    "confirm you're not a bot",
+    "confirm you’re not a bot",
+    "not a bot",
+    "bot check",
+    "http error 403",
+    "http error 429",
+    "player response",
+)
+
+
+class DatacenterBlockError(RuntimeError):
+    """YouTube blocked extraction (bot check / datacenter IP / empty response)."""
+
+
+def is_datacenter_block(value: Any) -> bool:
+    text = str(value or "").lower()
+    return any(marker in text for marker in DATACENTER_BLOCK_MARKERS)
+
+
+def _client_extractor_args(
+    clients: list[str] | None = None,
+) -> dict[str, Any]:
+    return {"youtube": {"player_client": list(clients or RESILIENT_PLAYER_CLIENTS)}}
+
+
+def _resilient_opts(
+    *, flat: bool = False, playlistend: int | None = None
+) -> dict[str, Any]:
+    options: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
-        "noplaylist": True,
         "socket_timeout": HTTP_TIMEOUT,
-        "retries": 3,
+        "retries": 2,
+        "extractor_args": _client_extractor_args(),
     }
-    with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(url, download=False)
+    if flat:
+        options["extract_flat"] = "in_playlist"
+    else:
+        options["noplaylist"] = True
+    if playlistend:
+        options["playlistend"] = playlistend
+    return options
+
+
+def _youtube_json_after(html_text: str, marker: str) -> dict[str, Any] | None:
+    index = html_text.find(marker)
+    while index != -1:
+        brace = html_text.find("{", index)
+        if brace != -1:
+            raw = _balanced_json(html_text, brace)
+            if raw:
+                try:
+                    return json.loads(raw)
+                except json.JSONDecodeError:
+                    pass
+        index = html_text.find(marker, index + len(marker))
+    return None
+
+
+def _og_meta(html_text: str) -> dict[str, str]:
+    meta: dict[str, str] = {}
+    for prop in ("og:title", "og:description", "og:image", "og:url"):
+        match = re.search(
+            rf'<meta[^>]+property=["\']{re.escape(prop)}["\'][^>]+content=["\']([^"\']*)',
+            html_text,
+            re.IGNORECASE,
+        )
+        if not match:
+            match = re.search(
+                rf'<meta[^>]+content=["\']([^"\']*)["\'][^>]+property=["\']{re.escape(prop)}["\']',
+                html_text,
+                re.IGNORECASE,
+            )
+        if match:
+            meta[prop] = html.unescape(match.group(1))
+    return meta
+
+
+def _video_info_from_page(
+    video_id: str, url: str, reason: str = ""
+) -> dict[str, Any]:
+    """Zero-fail metadata via oEmbed + watch-page HTML/OpenGraph/playerResponse."""
+    watch_url = f"https://www.youtube.com/watch?v={video_id}"
+    warnings: list[str] = [
+        "yt-dlp player response blocked (datacenter IP); used oEmbed + page HTML fallback"
+    ]
+    if reason:
+        warnings.append(f"yt-dlp said: {reason[:160]}")
+    oembed: dict[str, Any] = {}
+    try:
+        response = requests.get(
+            "https://www.youtube.com/oembed",
+            params={"url": watch_url, "format": "json"},
+            headers={"User-Agent": USER_AGENT},
+            timeout=HTTP_TIMEOUT,
+        )
+        if response.ok:
+            oembed = response.json()
+        else:
+            warnings.append(f"oEmbed HTTP {response.status_code}")
+    except Exception as exc:
+        warnings.append(f"oEmbed failed: {str(exc)[:100]}")
+
+    html_text = ""
+    try:
+        response = requests.get(
+            watch_url,
+            headers={"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"},
+            timeout=HTTP_TIMEOUT,
+        )
+        if response.ok:
+            html_text = response.text
+        else:
+            warnings.append(f"watch page HTTP {response.status_code}")
+    except Exception as exc:
+        warnings.append(f"watch page failed: {str(exc)[:100]}")
+
+    og = _og_meta(html_text) if html_text else {}
+    player = _youtube_json_after(html_text, "ytInitialPlayerResponse") if html_text else None
+    player = player or {}
+    details = player.get("videoDetails") or {}
+    micro = (
+        (player.get("microformat") or {}).get("playerMicroformatRenderer") or {}
+    )
+    title = str(
+        details.get("title") or oembed.get("title") or og.get("og:title") or ""
+    ).strip()
+    if not title:
+        raise DatacenterBlockError(
+            "Failed to extract any player response and HTML fallback had no title"
+        )
+    thumbnails = (
+        (details.get("thumbnail") or {}).get("thumbnails")
+        or []
+    )
+    thumbnail = str(
+        oembed.get("thumbnail_url")
+        or og.get("og:image")
+        or (thumbnails[-1].get("url") if thumbnails else "")
+        or ""
+    )
+    raw_keywords = details.get("keywords") or []
+    if isinstance(raw_keywords, str):
+        raw_keywords = [part for part in raw_keywords.split(",") if part]
+    channel_id = str(details.get("channelId") or micro.get("externalChannelId") or "")
+    publish_date = str(micro.get("publishDate") or "")
+    info: dict[str, Any] = {
+        "id": video_id,
+        "_type": "video",
+        "title": title,
+        "webpage_url": watch_url,
+        "url": watch_url,
+        "channel": str(
+            details.get("author")
+            or oembed.get("author_name")
+            or micro.get("ownerChannelName")
+            or ""
+        ),
+        "uploader": str(
+            details.get("author") or oembed.get("author_name") or ""
+        ),
+        "channel_id": channel_id,
+        "channel_url": (
+            f"https://www.youtube.com/channel/{channel_id}"
+            if channel_id
+            else str(oembed.get("author_url") or "")
+        ),
+        "description": str(
+            details.get("shortDescription") or og.get("og:description") or ""
+        ),
+        "duration": int(details.get("lengthSeconds") or 0) or None,
+        "view_count": int(details.get("viewCount") or 0) or None,
+        "tags": [str(tag) for tag in raw_keywords],
+        "categories": (
+            [str(micro.get("category"))] if micro.get("category") else []
+        ),
+        "thumbnail": thumbnail,
+        "thumbnails": [{"url": thumbnail, "width": 1280, "height": 720}]
+        if thumbnail
+        else [],
+        "upload_date": publish_date.replace("-", ""),
+        "_fallback": True,
+        "_warnings": warnings,
+        "_blocked_reason": reason,
+    }
+    return info
+
+
+def _channel_info_from_page(channel_url: str, reason: str = "") -> dict[str, Any]:
+    """Fallback channel info from the public /about page (no player response)."""
+    warnings: list[str] = [
+        "yt-dlp channel extraction blocked (datacenter IP); used About page fallback"
+    ]
+    if reason:
+        warnings.append(f"yt-dlp said: {reason[:160]}")
+    about = fetch_channel_about(channel_url)
+    metadata = about.get("metadata") or {}
+    about_vm = about.get("about") or {}
+    title = str(metadata.get("title") or "").strip()
+    if not title:
+        raise DatacenterBlockError(
+            "yt-dlp failed and channel About fallback had no title"
+        )
+    avatars = (metadata.get("avatar") or {}).get("thumbnails") or []
+    avatar = ""
+    if avatars:
+        avatar = str(
+            max(avatars, key=lambda thumb: thumb.get("width") or 0).get("url") or ""
+        )
+    channel_id = str(metadata.get("externalId") or about_vm.get("channelId") or "")
+    vanity = str(metadata.get("vanityChannelUrl") or metadata.get("channelUrl") or channel_url)
+    return {
+        "channel": title,
+        "title": title,
+        "channel_id": channel_id,
+        "channel_url": vanity,
+        "uploader_id": "",
+        "uploader_url": vanity,
+        "description": str(
+            metadata.get("description")
+            or about_vm.get("description")
+            or ""
+        ),
+        "channel_follower_count": None,
+        "thumbnails": [{"url": avatar, "width": 900}] if avatar else [],
+        "entries": [],
+        "_type": "playlist",
+        "_fallback": True,
+        "_warnings": warnings,
+        "_blocked_reason": reason,
+    }
+
+
+def extract_yt_info_resilient(
+    url: str, *, flat: bool = False, playlistend: int | None = None
+) -> dict[str, Any]:
+    """Extract yt-dlp info with datacenter-safe player clients + HTML fallback.
+
+    Raises ``DatacenterBlockError`` only when even oEmbed/HTML fallback cannot
+    produce a title (i.e. the URL is genuinely blocked or invalid).
+    """
+    last_error = ""
+    try:
+        with yt_dlp.YoutubeDL(_resilient_opts(flat=flat, playlistend=playlistend)) as ydl:
+            info = ydl.extract_info(url, download=False)
+        if isinstance(info, dict):
+            entries = [entry for entry in (info.get("entries") or []) if entry]
+            if info.get("title") or entries:
+                return info
+            last_error = "yt-dlp returned an empty result"
+        else:
+            last_error = "yt-dlp returned a non-dict result"
+    except Exception as exc:
+        last_error = str(exc)
+        logger.warning("Resilient yt-dlp extraction failed for %s: %s", url, exc)
+
+    video_id = extract_video_id(url)
+    if video_id:
+        return _video_info_from_page(video_id, url, last_error)
+    channel_url = extract_channel_url(url)
+    if channel_url:
+        return _channel_info_from_page(channel_url, last_error)
+    raise DatacenterBlockError(last_error or "YouTube extraction blocked")
+
+
+def fetch_metadata(url: str) -> dict[str, Any]:
+    """Fetch full video metadata with yt-dlp (datacenter-safe with HTML fallback)."""
+    info = extract_yt_info_resilient(url)
     if not isinstance(info, dict):
         raise RuntimeError("yt-dlp returned no metadata for this video.")
     if info.get("_type") == "playlist":
@@ -206,7 +470,9 @@ def fetch_metadata(url: str) -> dict[str, Any]:
             raise RuntimeError("No video found at that link.")
         info = entries[0]
     if not info.get("title"):
-        raise RuntimeError("This video's metadata could not be read (private, removed or age-restricted).")
+        raise DatacenterBlockError(
+            "This video's metadata could not be read (private, removed, age-restricted or blocked)."
+        )
     return info
 
 
@@ -346,7 +612,9 @@ def _extract_info_with_clients(video_id: str) -> dict[str, Any]:
         "skip_download": True,
         "socket_timeout": HTTP_TIMEOUT,
         "extractor_args": {
-            "youtube": {"player_client": ["android", "ios", "tv_embedded", "web"]}
+            "youtube": {
+                "player_client": ["tv_embedded", "android_vr", "ios", "mweb", "web"]
+            }
         },
     }
     with yt_dlp.YoutubeDL(options) as ydl:
@@ -675,6 +943,9 @@ CHANNEL_LIST_OPTS = {
     "extract_flat": "in_playlist",
     "socket_timeout": HTTP_TIMEOUT,
     "retries": 2,
+    "extractor_args": {
+        "youtube": {"player_client": ["tv_embedded", "android_vr", "ios", "mweb", "web"]}
+    },
 }
 
 FULL_ITEM_OPTS = {
@@ -684,6 +955,9 @@ FULL_ITEM_OPTS = {
     "noplaylist": True,
     "socket_timeout": HTTP_TIMEOUT,
     "retries": 2,
+    "extractor_args": {
+        "youtube": {"player_client": ["tv_embedded", "android_vr", "ios", "mweb", "web"]}
+    },
 }
 
 
@@ -1339,14 +1613,10 @@ def download_avatar(url: str, temp_dir: Path) -> Path | None:
 def fetch_channel_listing(
     channel_base_url: str, tab: str, limit: int
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Fetch a channel tab (videos/shorts) as a flat list of entries."""
-    options = dict(CHANNEL_LIST_OPTS)
-    if limit:
-        options["playlistend"] = limit
-    with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(f"{channel_base_url}/{tab}", download=False)
-    if not isinstance(info, dict):
-        raise RuntimeError(f"yt-dlp returned no data for the {tab} tab.")
+    """Fetch a channel tab (videos/shorts) as a flat list (datacenter-safe)."""
+    info = extract_yt_info_resilient(
+        f"{channel_base_url}/{tab}".rstrip("/"), flat=True, playlistend=limit or None
+    )
     entries = [
         entry
         for entry in (info.get("entries") or [])
@@ -2005,6 +2275,10 @@ def audit_channel(
                 f"Could not load that channel: {str(first_exc)[:300]}"
             ) from first_exc
     resolved_url = _resolve_channel_base(base_url, listing)
+    if listing.get("_fallback") and not video_entries:
+        raise DatacenterBlockError(
+            "Channel listing blocked on this host (datacenter IP / bot check)"
+        )
     about_data = fetch_channel_about(resolved_url)
     profile = build_channel_profile(resolved_url, listing, about_data)
     banner_url = channel_banner_url(listing, about_data)
@@ -2553,6 +2827,14 @@ async def process_channel(message: Message, channel_url: str) -> None:
         await live.edit(force=True)
     except Exception as exc:
         logger.exception("Channel audit failed for %s", channel_url)
+        if is_datacenter_block(exc) and await _auto_failover_to_actions(
+            message, channel_url, str(exc)
+        ):
+            card.set_state(
+                "⚠️ Render IP blocked — switched to GitHub Actions cloud runner"
+            )
+            await live.edit(force=True)
+            return
         live.mark_failed(exc)
         if result is not None:
             card.add_trace(f"💾 Workbook: {result.xlsx_path.name}")
@@ -3019,6 +3301,8 @@ def build_smart_video_bundle(
     watch_url = f"https://www.youtube.com/watch?v={video_id}"
     note("Fetching video metadata with yt-dlp")
     info = fetch_metadata(watch_url)
+    blocked = bool(info.get("_fallback"))
+    warnings = list(info.get("_warnings") or [])
     item = build_channel_item(
         info,
         "Video",
@@ -3053,6 +3337,9 @@ def build_smart_video_bundle(
         channel_url = str(channel.get("channel_url") or "")
         if channel_url:
             listing, _ = fetch_channel_listing(channel_url, "videos", 1)
+            if listing.get("_fallback"):
+                blocked = True
+                warnings.append("channel video listing blocked on this host")
             about_data = fetch_channel_about(channel_url)
             profile = build_channel_profile(channel_url, listing, about_data)
             channel_stem = safe_stem(profile.name, "Channel")
@@ -3069,6 +3356,9 @@ def build_smart_video_bundle(
                 banner_file = banner_target.name
     except Exception as exc:
         logger.warning("Channel enrichment failed: %s", exc)
+        if is_datacenter_block(exc):
+            blocked = True
+            warnings.append(f"channel extraction blocked: {str(exc)[:160]}")
 
     note("Gemini Hook Analysis + Audience Pulse (no summary)")
     hook = (
@@ -3081,11 +3371,17 @@ def build_smart_video_bundle(
         viral = viral_videos(watch_url, 5)
     except Exception as exc:
         viral = {"channel": {}, "videos": [], "error": str(exc)[:160]}
+        if is_datacenter_block(exc):
+            blocked = True
+            warnings.append(f"viral listing blocked: {str(exc)[:160]}")
     note("Finding similar channels")
     try:
         similar = similar_channels(watch_url, 6)
     except Exception as exc:
         similar = {"channels": [], "error": str(exc)[:160]}
+        if is_datacenter_block(exc):
+            blocked = True
+            warnings.append(f"similar search blocked: {str(exc)[:160]}")
 
     markdown_path = OUTPUT_DIR / f"{video_stem}_{video_id}_Intel.md"
     markdown_path.write_text(
@@ -3114,6 +3410,8 @@ def build_smart_video_bundle(
         "banner_path": OUTPUT_DIR / banner_file if banner_file else None,
         "markdown_path": markdown_path,
         "audio_used": audio_used,
+        "blocked": blocked,
+        "warnings": warnings,
     }
 
 
@@ -3209,6 +3507,28 @@ def build_smart_video_markdown(
     return "\n".join(lines)
 
 
+async def _auto_failover_to_actions(message: Message, url: str, reason: str = "") -> bool:
+    """AUTO mode: dispatch a blocked YouTube extraction to GitHub Actions."""
+    if execution_mode.current_mode() != "AUTO":
+        return False
+    ok, detail = await asyncio.to_thread(
+        dispatch_github_batch, [url], message.chat_id or telegram_chat_id()
+    )
+    if not ok:
+        logger.warning("Auto-failover to GitHub Actions failed: %s", detail)
+        return False
+    logger.info("Auto-failover dispatched %s (%s)", url, reason[:160])
+    try:
+        await message.reply_text(
+            "⚠️ Render IP blocked by YouTube — auto-switched to GitHub Actions "
+            "cloud runner! Results will arrive here shortly.",
+            parse_mode="HTML",
+        )
+    except TelegramError as exc:
+        logger.warning("Could not send auto-failover notice: %s", exc)
+    return True
+
+
 async def process_smart_video(message: Message, video_id: str) -> None:
     card = ProgressCard(
         title=f"🧠 Smart Video Intelligence — {video_id}",
@@ -3231,6 +3551,18 @@ async def process_smart_video(message: Message, video_id: str) -> None:
         bundle = await _run_with_live_progress(
             lambda progress: build_smart_video_bundle(video_id, progress), live
         )
+        if bundle.get("blocked") and await _auto_failover_to_actions(
+            message,
+            f"https://www.youtube.com/watch?v={video_id}",
+            "; ".join(bundle.get("warnings") or []),
+        ):
+            card.set_state(
+                "⚠️ Render IP blocked — switched to GitHub Actions cloud runner"
+            )
+            card.finish_step(4)
+            card.add_trace("Auto-failover dispatched; results will arrive from Actions")
+            await live.edit(force=True)
+            return
         card.finish_step(1)
         card.finish_step(2)
         card.finish_step(3)
@@ -3277,6 +3609,15 @@ async def process_smart_video(message: Message, video_id: str) -> None:
         await live.edit(force=True)
     except Exception as exc:
         logger.exception("Smart video pipeline failed")
+        if is_datacenter_block(exc) and await _auto_failover_to_actions(
+            message, f"https://www.youtube.com/watch?v={video_id}", str(exc)
+        ):
+            card.set_state(
+                "⚠️ Render IP blocked — switched to GitHub Actions cloud runner"
+            )
+            card.add_trace("Auto-failover dispatched after extraction error")
+            await live.edit(force=True)
+            return
         live.mark_failed(exc)
         await live.edit(force=True)
 

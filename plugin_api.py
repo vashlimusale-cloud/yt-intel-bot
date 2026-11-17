@@ -40,6 +40,48 @@ MAX_COMMENTS = 20
 MAX_COMMENT_CHARS = 220
 
 
+def _auto_failover(url: str, reason: str = "") -> tuple[int, dict[str, Any]]:
+    """AUTO mode: route blocked Render extraction to GitHub Actions (HTTP 202)."""
+    try:
+        mode = bot.execution_mode.current_mode()
+    except Exception:
+        mode = "AUTO"
+    if mode != "AUTO":
+        return 200, {
+            "ok": False,
+            "warnings": [
+                f"YouTube extraction blocked on this host ({reason[:160]}); "
+                f"mode={mode} does not auto-failover"
+            ],
+        }
+    chat_id = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
+    if not chat_id:
+        return 200, {
+            "ok": False,
+            "warnings": [f"extraction blocked ({reason[:160]}); TELEGRAM_CHAT_ID missing"],
+        }
+    ok, detail = bot.dispatch_github_batch([url], chat_id)
+    if ok:
+        logger.info("Plugin extraction blocked; dispatched %s to GitHub Actions", url)
+        return 202, {
+            "ok": True,
+            "routed_to": "github_actions",
+            "message": (
+                "Render blocked; auto-dispatched to GitHub Actions and results "
+                "will be delivered to Telegram."
+            ),
+            "warnings": [f"deep extraction blocked on this host: {reason[:200]}"],
+        }
+    logger.warning("Plugin failover dispatch failed: %s", detail)
+    return 200, {
+        "ok": False,
+        "warnings": [
+            f"extraction blocked: {reason[:160]}",
+            f"failover unavailable: {detail[:160]}",
+        ],
+    }
+
+
 def public_base_url() -> str:
     base = (os.getenv("PUBLIC_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").strip()
     return base.rstrip("/") or "https://your-service.onrender.com"
@@ -173,6 +215,8 @@ def _video_id(url: str) -> str:
 
 def _channel_meta(channel_url: str) -> dict[str, Any]:
     listing, _ = bot.fetch_channel_listing(channel_url, "videos", 1)
+    if isinstance(listing, dict) and listing.get("_fallback"):
+        raise bot.DatacenterBlockError("Channel listing blocked on this host")
     profile = bot.build_channel_profile(
         channel_url, listing, bot.fetch_channel_about(channel_url)
     )
@@ -198,6 +242,8 @@ def video_payload(url: str) -> dict[str, Any]:
     video_id = _video_id(url)
     watch_url = f"https://www.youtube.com/watch?v={video_id}"
     info = bot.fetch_metadata(watch_url)
+    blocked = bool(info.get("_fallback"))
+    warnings = list(info.get("_warnings") or [])
     transcript = bot.fetch_transcript(video_id, bot._caption_tracks(info))
     audio_used = False
     if not transcript and ai_analyzer.available():
@@ -205,7 +251,11 @@ def video_payload(url: str) -> dict[str, Any]:
         audio_used = bool(transcript)
     comments = bot.fetch_comments(watch_url, limit=MAX_COMMENTS)
     hook = ai_analyzer.analyze_hook_and_pulse(transcript, comments)
-    channel = recommender.resolve_channel(watch_url)
+    channel: dict[str, Any] = {}
+    try:
+        channel = recommender.resolve_channel(watch_url)
+    except Exception as exc:
+        warnings.append(f"channel lookup failed: {str(exc)[:120]}")
     channel_meta: dict[str, Any] = {
         "name": channel.get("name"),
         "handle": channel.get("handle"),
@@ -214,7 +264,12 @@ def video_payload(url: str) -> dict[str, Any]:
     if channel.get("channel_url"):
         try:
             channel_meta = _channel_meta(channel["channel_url"])
+        except bot.DatacenterBlockError as exc:
+            blocked = True
+            warnings.append(f"channel deep extraction blocked: {exc}")
+            logger.warning("Plugin channel lookup blocked: %s", exc)
         except Exception as exc:  # metadata is best effort
+            warnings.append(f"channel metadata unavailable: {str(exc)[:120]}")
             logger.warning("Plugin channel lookup failed: %s", exc)
 
     transcript_used = transcript[:MAX_TRANSCRIPT]
@@ -246,6 +301,8 @@ def video_payload(url: str) -> dict[str, Any]:
         ],
         "hook_analysis": hook,
         "channel": channel_meta,
+        "blocked": blocked,
+        "warnings": warnings,
         "token_usage_note": ai_analyzer.token_note(
             [
                 "video metadata",
@@ -265,6 +322,8 @@ def channel_payload(url: str) -> dict[str, Any]:
         raise RuntimeError("Could not resolve that channel")
     meta = _channel_meta(channel_url)
     info = recommender._flat_info(f"{channel_url.rstrip('/')}/videos", 20)
+    blocked = bool(info.get("_fallback"))
+    warnings = list(info.get("_warnings") or [])
     entries = recommender._entries(info)
     ranked = sorted(entries, key=lambda entry: entry.get("view_count") or 0, reverse=True)[:5]
     return {
@@ -278,6 +337,8 @@ def channel_payload(url: str) -> dict[str, Any]:
             }
             for entry in ranked
         ],
+        "blocked": blocked,
+        "warnings": warnings,
         "token_usage_note": ai_analyzer.token_note(
             ["channel profile", "channel about", "banner", "avatar", "top 5 videos"]
         ),
@@ -290,6 +351,8 @@ def similar_payload(url: str) -> dict[str, Any]:
         "channel": result.get("channel"),
         "search_query": result.get("query"),
         "similar_channels": result.get("channels", []),
+        "blocked": False,
+        "warnings": [],
         "token_usage_note": ai_analyzer.token_note(
             ["parent channel", "niche keywords", "YouTube search results (5-8 peers)"]
         ),
@@ -337,8 +400,12 @@ def detect_modules(request: str) -> list[str]:
 def smart_query_payload(url: str, request: str) -> dict[str, Any]:
     modules = detect_modules(request)
     data: dict[str, Any] = {}
+    blocked = False
+    warnings: list[str] = []
     if any(module in modules for module in ("video", "transcript", "comments", "hook_audience")):
         video = video_payload(url)
+        blocked = bool(video.get("blocked"))
+        warnings.extend(video.get("warnings") or [])
         payload = {
             "video": video["video"],
             "channel": video["channel"],
@@ -356,21 +423,33 @@ def smart_query_payload(url: str, request: str) -> dict[str, Any]:
             data["channel"] = channel_payload(url)["channel"]
         except Exception as exc:
             data["channel_error"] = str(exc)[:160]
+            if bot.is_datacenter_block(exc) or isinstance(exc, bot.DatacenterBlockError):
+                blocked = True
+                warnings.append(f"channel blocked: {str(exc)[:160]}")
     if "similar" in modules:
         try:
             data["similar_channels"] = similar_payload(url)
         except Exception as exc:
             data["similar_error"] = str(exc)[:160]
+            if bot.is_datacenter_block(exc) or isinstance(exc, bot.DatacenterBlockError):
+                blocked = True
+                warnings.append(f"similar blocked: {str(exc)[:160]}")
     if "viral" in modules:
         try:
             data["viral_videos"] = recommender.viral_videos(url, limit=5)
         except Exception as exc:
             data["viral_error"] = str(exc)[:160]
+            if bot.is_datacenter_block(exc) or isinstance(exc, bot.DatacenterBlockError):
+                blocked = True
+                warnings.append(f"viral blocked: {str(exc)[:160]}")
+    deep_modules = {"video", "channel", "hook_audience", "similar", "viral"}
     return {
         "url": url,
         "request": request,
         "modules_used": modules,
         "data": data,
+        "blocked": blocked and bool(deep_modules.intersection(modules)),
+        "warnings": warnings,
         "token_usage_note": ai_analyzer.token_note(modules),
     }
 
@@ -402,14 +481,30 @@ def handle_request(
         return 400, {"error": "missing 'url'"}
     try:
         if path == "/api/smart_query":
-            return 200, smart_query_payload(url, str(payload.get("request") or "analyse this"))
-        if path == "/api/video":
-            return 200, video_payload(url)
-        if path == "/api/channel":
-            return 200, channel_payload(url)
-        if path == "/api/similar":
-            return 200, similar_payload(url)
+            payload = smart_query_payload(url, str(payload.get("request") or "analyse this"))
+        elif path == "/api/video":
+            payload = video_payload(url)
+        elif path == "/api/channel":
+            payload = channel_payload(url)
+        elif path == "/api/similar":
+            payload = similar_payload(url)
+        else:
+            return 404, {"error": "unknown endpoint"}
+        if payload.pop("blocked", False):
+            reason = "; ".join(payload.get("warnings") or []) or "extraction blocked"
+            return _auto_failover(url, reason)
+        return 200, payload
+    except ValueError as exc:
+        return 400, {"error": str(exc)[:300]}
+    except bot.DatacenterBlockError as exc:
+        return _auto_failover(url, str(exc))
     except Exception as exc:
-        logger.exception("Plugin endpoint failed: %s", exc)
-        return 500, {"error": str(exc)[:300]}
+        logger.exception("Plugin endpoint extraction issue: %s", exc)
+        if bot.is_datacenter_block(exc):
+            return _auto_failover(url, str(exc))
+        # Never surface an unhandled 500 for YouTube extraction problems.
+        return 200, {
+            "ok": False,
+            "warnings": [f"extraction failed: {str(exc)[:200]}"],
+        }
     return 404, {"error": "unknown endpoint"}

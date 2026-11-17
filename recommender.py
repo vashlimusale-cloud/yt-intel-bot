@@ -30,12 +30,8 @@ STOPWORDS = {
 
 
 def _flat_info(url: str, limit: int | None = None) -> dict[str, Any]:
-    options = dict(FLAT_OPTS)
-    if limit:
-        options["playlistend"] = limit
-    with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(url, download=False)
-    return info if isinstance(info, dict) else {}
+    """Flat yt-dlp extraction with the datacenter-safe client + HTML fallback."""
+    return bot.extract_yt_info_resilient(url, flat=True, playlistend=limit)
 
 
 def _entries(info: dict[str, Any]) -> list[dict[str, Any]]:
@@ -80,6 +76,10 @@ def viral_videos(video_or_channel_url: str, limit: int = 5) -> dict[str, Any]:
     if not channel.get("channel_url"):
         raise RuntimeError("Could not resolve the parent channel")
     info = _flat_info(f"{channel['channel_url'].rstrip('/')}/videos", 60)
+    if isinstance(info, dict) and info.get("_fallback"):
+        raise bot.DatacenterBlockError(
+            "Channel video listing blocked on this datacenter IP"
+        )
     entries = _entries(info)
     ranked = sorted(
         entries,
