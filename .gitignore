@@ -9,6 +9,7 @@ output/
 *.jpg
 *.md
 !README.md
+!PLUGIN_SETUP.md
 
 # --- Python ------------------------------------------------------------------
 __pycache__/
@@ -19,3 +20,6 @@ __pycache__/
 
 # --- Local scratch -----------------------------------------------------------
 staging/
+.mode_state.json
+.poller_state.json
+*.log

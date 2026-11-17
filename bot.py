@@ -34,13 +34,27 @@ from urllib.parse import parse_qs, urlparse
 import requests
 import yt_dlp
 from dotenv import load_dotenv
-from telegram import Message, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    Update,
+)
 from telegram.constants import ChatAction
 from telegram.error import TelegramError, TimedOut
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 from youtube_comment_downloader import SORT_BY_POPULAR, YoutubeCommentDownloader
 from youtube_transcript_api import NoTranscriptFound, YouTubeTranscriptApi
 
+import ai_analyzer
+import execution_mode
 from progress import ProgressCard
 
 try:  # channel audits need openpyxl; single-video mode still works without it
@@ -722,6 +736,7 @@ class ChannelItem:
     captions: dict[str, Any] = field(default_factory=dict)
     thumbnail_url: str = ""
     thumbnail_file: str = ""
+    ai: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -1165,10 +1180,122 @@ def fetch_channel_about(channel_base_url: str) -> dict[str, Any]:
         return {}
     about = next(iter(_walk_values(data, "aboutChannelViewModel")), {})
     metadata = next(iter(_walk_values(data, "channelMetadataRenderer")), {})
-    return {
+    result = {
         "about": about if isinstance(about, dict) else {},
         "metadata": metadata if isinstance(metadata, dict) else {},
     }
+    banner = _banner_from_initial_data(data)
+    if banner:
+        result["banner_url"] = banner
+    return result
+
+
+# --------------------------------------------------------------------------- #
+# Channel banner (cover art)
+# --------------------------------------------------------------------------- #
+BANNER_NODE_KEYS = ("banner", "mobileBanner", "tvBanner", "imageBannerViewModel")
+
+
+def _upgrade_banner_url(url: str) -> str:
+    cleaned = str(url or "").strip()
+    if not cleaned:
+        return ""
+    if cleaned.startswith("//"):
+        cleaned = "https:" + cleaned
+    cleaned = cleaned.split("?")[0]
+    return re.sub(r"=w\d+[^/]*$", "=w2560", cleaned)
+
+
+def _collect_image_urls(node: Any, found: list[tuple[int, str]], depth: int = 0) -> None:
+    if depth > 40:
+        return
+    if isinstance(node, dict):
+        url = node.get("url")
+        if isinstance(url, str) and "yt3" in url:
+            found.append((int(node.get("width") or 0), url))
+        for value in node.values():
+            _collect_image_urls(value, found, depth + 1)
+    elif isinstance(node, list):
+        for item in node:
+            _collect_image_urls(item, found, depth + 1)
+
+
+def _banner_from_initial_data(data: dict[str, Any]) -> str:
+    """Find banner/mobileBanner/tvBanner image sources in the About page data."""
+    candidates: list[tuple[int, str]] = []
+
+    def scan(node: Any, depth: int = 0) -> None:
+        if depth > 50:
+            return
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key in BANNER_NODE_KEYS:
+                    _collect_image_urls(value, candidates)
+                scan(value, depth + 1)
+        elif isinstance(node, list):
+            for item in node:
+                scan(item, depth + 1)
+
+    scan(data)
+    if not candidates:
+        return ""
+    best = max(candidates, key=lambda pair: pair[0])
+    return _upgrade_banner_url(best[1])
+
+
+def channel_banner_url(listing: dict[str, Any], about_data: dict[str, Any] | None = None) -> str:
+    """Best channel banner URL from About data or yt-dlp channel thumbnails."""
+    if isinstance(about_data, dict) and about_data.get("banner_url"):
+        return str(about_data["banner_url"])
+    best_url = ""
+    best_width = 0
+    for thumb in (listing or {}).get("thumbnails") or []:
+        if not isinstance(thumb, dict):
+            continue
+        url = str(thumb.get("url") or "")
+        width = int(thumb.get("width") or 0)
+        height = int(thumb.get("height") or 0)
+        is_banner = (
+            "banner" in url.lower()
+            or width >= 1000
+            or (height and width / max(height, 1) > 2)
+        )
+        if is_banner and width >= best_width and url:
+            best_url, best_width = url, width
+    return _upgrade_banner_url(best_url)
+
+
+def download_channel_banner(url: str, dest: Path) -> Path | None:
+    """Download a channel banner as a real .jpg."""
+    if not url:
+        return None
+    try:
+        response = requests.get(
+            url,
+            timeout=HTTP_TIMEOUT,
+            headers={"User-Agent": USER_AGENT, "Accept": "image/jpeg,image/png,image/*"},
+        )
+    except requests.RequestException as exc:
+        logger.warning("Banner download failed: %s", exc)
+        return None
+    if not response.ok or len(response.content) < 3000:
+        return None
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if response.content[:3] == b"\xff\xd8\xff":
+        dest.write_bytes(response.content)
+        return dest
+    try:
+        from PIL import Image
+
+        with Image.open(io.BytesIO(response.content)) as image:
+            image.convert("RGB").save(dest, "JPEG", quality=92)
+        return dest
+    except Exception:
+        try:
+            dest.write_bytes(response.content)
+            return dest
+        except OSError:
+            return None
 
 
 def download_avatar(url: str, temp_dir: Path) -> Path | None:
@@ -1537,6 +1664,9 @@ def write_channel_workbook(
     items: list[ChannelItem],
     posts: list[CommunityPost],
     dest: Path,
+    *,
+    banner_file: str = "",
+    banner_url: str = "",
 ) -> Path:
     """Write the 4-tab Channel Intelligence workbook."""
     if not OPENPYXL_AVAILABLE:
@@ -1545,6 +1675,10 @@ def write_channel_workbook(
     videos = [item for item in items if item.kind == "Video"]
     shorts = [item for item in items if item.kind == "Short"]
     collaborators = collect_collaborators(items, posts)
+    banner_rows = [
+        ["Channel", "Banner URL", banner_url or "N/A"],
+        ["Channel", "Banner File", banner_file or "N/A"],
+    ]
 
     workbook = Workbook()
 
@@ -1553,7 +1687,7 @@ def write_channel_workbook(
     _write_table(
         overview,
         ["Section", "Metric", "Value"],
-        _overview_rows(profile, items, posts, collaborators),
+        banner_rows + _overview_rows(profile, items, posts, collaborators),
         freeze=False,
         wrap_columns=(3,),
         caps={1: 24, 2: 34, 3: 90},
@@ -1681,7 +1815,12 @@ def _md_link(label: str, url: str) -> str:
 
 
 def build_channel_markdown(
-    profile: ChannelProfile, items: list[ChannelItem], posts: list[CommunityPost]
+    profile: ChannelProfile,
+    items: list[ChannelItem],
+    posts: list[CommunityPost],
+    *,
+    banner_file: str = "",
+    banner_url: str = "",
 ) -> str:
     videos = [item for item in items if item.kind == "Video"]
     shorts = [item for item in items if item.kind == "Short"]
@@ -1691,6 +1830,10 @@ def build_channel_markdown(
     lines: list[str] = [f"# {profile.name}", ""]
     if profile.avatar_url:
         lines += [f"![Channel Avatar]({profile.avatar_url})", ""]
+    if banner_file:
+        lines += [f"![Channel Banner](./{banner_file})", ""]
+    elif banner_url:
+        lines += [f"![Channel Banner]({banner_url})", ""]
 
     lines += [
         "## 📊 Channel Profile",
@@ -1702,6 +1845,8 @@ def build_channel_markdown(
         ("Handle", profile.handle or "N/A"),
         ("Channel URL", profile.url),
         ("Channel ID", profile.channel_id or "N/A"),
+        ("Banner URL", banner_url or "N/A"),
+        ("Banner File", banner_file or "N/A"),
         ("Subscribers", profile.subscribers_text or _fmt_int(profile.subscribers)),
         ("Total Channel Views", profile.total_views_text or _fmt_int(profile.total_views)),
         ("Total Videos (per YouTube)", profile.video_count_text or _fmt_int(profile.video_count)),
@@ -1860,7 +2005,9 @@ def audit_channel(
                 f"Could not load that channel: {str(first_exc)[:300]}"
             ) from first_exc
     resolved_url = _resolve_channel_base(base_url, listing)
-    profile = build_channel_profile(resolved_url, listing, fetch_channel_about(resolved_url))
+    about_data = fetch_channel_about(resolved_url)
+    profile = build_channel_profile(resolved_url, listing, about_data)
+    banner_url = channel_banner_url(listing, about_data)
     own_handles = tuple(
         handle for handle in (profile.handle, profile.channel_id) if handle
     )
@@ -1896,19 +2043,41 @@ def audit_channel(
     note("Scraping community posts")
     posts = fetch_community_posts(resolved_url, own_handles)
     note(f"Community posts found: {len(posts)}")
-    note("Downloading the channel avatar")
+    note("Downloading the channel avatar and banner")
     avatar_path = download_avatar(profile.avatar_url, temp_dir)
     note("Resolving collaborator channel names")
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    stem = f"{safe_stem(profile.name, 'YouTube_Channel')}_Channel_Intel"
+    channel_stem = safe_stem(profile.name, "YouTube_Channel")
+    banner_file = ""
+    banner_path = download_channel_banner(
+        banner_url, OUTPUT_DIR / f"{channel_stem}_banner.jpg"
+    )
+    if banner_path is not None:
+        banner_file = banner_path.name
+        note(f"Banner saved: {banner_file}")
+    stem = f"{channel_stem}_Channel_Intel"
     xlsx_path = OUTPUT_DIR / f"{stem}.xlsx"
     markdown_path = OUTPUT_DIR / f"{stem}.md"
     items = videos + shorts
     resolve_collaborator_ids(items, posts, own_channel_id=profile.channel_id)
     note("Writing the Excel workbook and Markdown report")
-    write_channel_workbook(profile, items, posts, xlsx_path)
+    write_channel_workbook(
+        profile,
+        items,
+        posts,
+        xlsx_path,
+        banner_file=banner_file,
+        banner_url=banner_url,
+    )
     markdown_path.write_text(
-        build_channel_markdown(profile, items, posts), encoding="utf-8"
+        build_channel_markdown(
+            profile,
+            items,
+            posts,
+            banner_file=banner_file,
+            banner_url=banner_url,
+        ),
+        encoding="utf-8",
     )
     return ChannelAuditResult(
         profile=profile,
@@ -2084,21 +2253,20 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if message is None:
         return
     await message.reply_text(
-        "👋 Send me a YouTube video, Shorts or channel link — I keep a live, "
-        "expandable 🧠 progress card updated while I work.\n\n"
-        "• Video / Shorts → thumbnail + Markdown file with metadata, description, "
-        "transcript and every comment.\n"
-        "• Channel → avatar + Excel Channel Intelligence workbook + Markdown SEO audit.\n"
-        "• /batch + ANY mix of channel and video links (or paste 2+ links) → runs the "
-        "whole batch in the cloud on GitHub Actions, then shut your laptop down: live "
-        "Thinking updates + categorized Excel/Markdown/ZIP arrive right here.\n\n"
-        "Examples:\n"
-        "• https://www.youtube.com/watch?v=dQw4w9WgXcQ\n"
-        "• https://youtu.be/dQw4w9WgXcQ\n"
-        "• https://www.youtube.com/shorts/dQw4w9WgXcQ\n"
-        "• https://www.youtube.com/@MrBeast\n"
-        "• https://www.youtube.com/channel/UCX6OQ3DkcsbYNE6H8uQQuVA\n"
-        "• /batch https://www.youtube.com/@MrBeast https://youtu.be/dQw4w9WgXcQ"
+        "👋 <b>YT-Bot</b> — YouTube intelligence with a live 🧠 thinking card.\n\n"
+        "<b>Commands</b>\n"
+        "• <code>/video &lt;url&gt;</code> — video + channel DP/banner + Gemini hook &amp; "
+        "audience + top 5 viral + 5 similar channels\n"
+        "• <code>/channel &lt;url&gt;</code> — full channel audit (Excel + Markdown)\n"
+        "• <code>/batch &lt;urls…&gt;</code> or 2+ links — cloud batch (or Render-only)\n"
+        "• <code>/viral &lt;url&gt;</code> — top 5 most-viewed videos on that channel\n"
+        "• <code>/similar &lt;url&gt;</code> — 5-8 peer channels in the same niche\n"
+        "• <code>/mode</code> — switch engine: ⚡ Auto / 🖥️ Render / ☁️ GitHub / 💻 Local\n"
+        "• <code>/help</code> — this card\n\n"
+        "A single YouTube link runs the full smart video pipeline automatically; "
+        "inline buttons let you extract viral videos, the full channel, or switch engine.",
+        parse_mode="HTML",
+        reply_markup=mode_keyboard(),
     )
 
 
@@ -2162,23 +2330,18 @@ async def handle_youtube_link(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     channels, videos = extract_batch_links(message.text)
-    if len(channels) + len(videos) >= 2:
-        await _handle_cloud_batch(message, channels, videos)
+    total = len(channels) + len(videos)
+    if total >= 2:
+        await _route_batch(message, channels, videos)
         return
-
-    if cloud_single_links_enabled() and (channels or videos):
-        await _handle_cloud_batch(message, channels, videos)
-        return
-
-    video_id = extract_video_id(videos[0]) if videos else None
-    if video_id:
-        await process_video(message, video_id)
+    if videos:
+        await _route_single_video(message, extract_video_id(videos[0]) or "")
         return
     if channels:
-        await process_channel(message, channels[0])
+        await _route_channel(message, channels[0])
         return
 
-    await message.reply_text(HINT_TEXT)
+    await message.reply_text(HINT_TEXT, reply_markup=mode_keyboard())
 
 
 async def process_video(message: Message, video_id: str) -> None:
@@ -2239,13 +2402,19 @@ async def process_video(message: Message, video_id: str) -> None:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-async def _send_photo_safe(message: Message, path: Path, caption: str) -> bool:
+async def _send_photo_safe(
+    message: Message,
+    path: Path,
+    caption: str,
+    reply_markup: Any = None,
+) -> bool:
     """Send a photo; a timeout is logged but never aborts the handler."""
     try:
         await message.reply_photo(
             photo=path,
             caption=caption[:MAX_CAPTION],
             parse_mode="HTML",
+            reply_markup=reply_markup,
             read_timeout=TELEGRAM_READ_TIMEOUT,
             write_timeout=TELEGRAM_WRITE_TIMEOUT,
         )
@@ -2258,7 +2427,12 @@ async def _send_photo_safe(message: Message, path: Path, caption: str) -> bool:
         return False
 
 
-async def _send_document_with_retry(message: Message, path: Path, caption: str) -> None:
+async def _send_document_with_retry(
+    message: Message,
+    path: Path,
+    caption: str,
+    reply_markup: Any = None,
+) -> None:
     """Send a document, retrying once after TimedOut; raises if both attempts fail."""
     for attempt in range(1, DOCUMENT_SEND_ATTEMPTS + 1):
         try:
@@ -2267,6 +2441,7 @@ async def _send_document_with_retry(message: Message, path: Path, caption: str) 
                 filename=path.name,
                 caption=caption[:MAX_CAPTION],
                 parse_mode="HTML",
+                reply_markup=reply_markup,
                 read_timeout=TELEGRAM_READ_TIMEOUT,
                 write_timeout=TELEGRAM_WRITE_TIMEOUT,
             )
@@ -2524,11 +2699,590 @@ async def cmd_batch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     channels, videos = extract_batch_links(text)
     if not channels and not videos and context.args:
         channels, videos = extract_batch_links(" ".join(context.args))
-    await _handle_cloud_batch(message, channels, videos)
+    await _route_batch(message, channels, videos)
 
 
 # --------------------------------------------------------------------------- #
-# Render.com health endpoint + cloud routing
+# Execution engine selection (/mode) + inline buttons
+# --------------------------------------------------------------------------- #
+def mode_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(execution_mode.mode_label(mode), callback_data=f"engine:{mode}")]
+        for mode in execution_mode.MODE_ORDER
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def reply_buttons(video_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🔥 Extract Top 5 Viral Videos", callback_data=f"viral:{video_id}"
+                ),
+                InlineKeyboardButton(
+                    "📊 Extract Full Channel", callback_data=f"chan:{video_id}"
+                ),
+            ],
+            [InlineKeyboardButton("⚙️ Switch Engine", callback_data="engine:menu")],
+        ]
+    )
+
+
+def _mode_card_text() -> str:
+    mode = execution_mode.current_mode()
+    return (
+        f"⚙️ <b>Execution engine:</b> {execution_mode.mode_label(mode)}\n"
+        f"{execution_mode.describe_mode(mode)}\n\n"
+        "• 🖥️ <b>Render Only</b> — 100% of jobs run on this Render instance\n"
+        "• ☁️ <b>GitHub Only</b> — 100% dispatched to GitHub Actions\n"
+        "• 💻 <b>Local PC Only</b> — Render standby; your PC runs everything\n"
+        "• ⚡ <b>Auto (Never Fail)</b> — fast jobs local, heavy /channel &amp; /batch "
+        "on Actions, 5-min failover poller as safety net\n\n"
+        "Pick an engine:"
+    )
+
+
+async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+    await message.reply_text(
+        _mode_card_text(), parse_mode="HTML", reply_markup=mode_keyboard()
+    )
+
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+    await query.answer()
+    data = str(query.data or "")
+    message = query.message
+    if data == "engine:menu":
+        await query.edit_message_text(
+            _mode_card_text(), parse_mode="HTML", reply_markup=mode_keyboard()
+        )
+        return
+    if data.startswith("engine:"):
+        mode = execution_mode.normalize_mode(data.split(":", 1)[1])
+        ok, detail = await asyncio.to_thread(execution_mode.sync_mode, mode)
+        text = (
+            f"✅ <b>Engine switched to {execution_mode.mode_label(mode)}</b>\n"
+            f"{execution_mode.describe_mode(mode)}\n"
+            f"GitHub sync: {'✅ ' + detail if ok else '⚠️ ' + detail}"
+        )
+        try:
+            await query.edit_message_text(
+                text, parse_mode="HTML", reply_markup=mode_keyboard()
+            )
+        except TelegramError:
+            await message.reply_text(text, parse_mode="HTML", reply_markup=mode_keyboard())
+        return
+    if data.startswith("viral:"):
+        video_id = data.split(":", 1)[1]
+        await _send_viral_message(message, video_id)
+        return
+    if data.startswith("chan:"):
+        video_id = data.split(":", 1)[1]
+        watch_url = f"https://www.youtube.com/watch?v={video_id}"
+        try:
+            from recommender import resolve_channel
+
+            channel = await asyncio.to_thread(resolve_channel, watch_url)
+        except Exception as exc:
+            await message.reply_text(f"❌ Could not resolve the channel: {exc}")
+            return
+        await _route_channel(message, channel.get("channel_url") or "")
+
+
+# --------------------------------------------------------------------------- #
+# Commands
+# --------------------------------------------------------------------------- #
+def _command_payload(message: Message, command: str) -> str:
+    text = message.text or ""
+    lowered = text.lower()
+    if lowered.startswith(command):
+        text = text[len(command):]
+    return text.strip()
+
+
+async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+    payload_text = _command_payload(message, "/video") or " ".join(context.args or [])
+    channels, videos = extract_batch_links(payload_text)
+    video_id = extract_video_id(videos[0]) if videos else None
+    if not video_id:
+        await message.reply_text("Usage: <code>/video https://youtu.be/VIDEO_ID</code>", parse_mode="HTML")
+        return
+    await _route_single_video(message, video_id)
+
+
+async def cmd_channel_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+    payload_text = _command_payload(message, "/channel") or " ".join(context.args or [])
+    channels, _videos = extract_batch_links(payload_text)
+    channel_url = channels[0] if channels else extract_channel_url(payload_text)
+    if not channel_url:
+        await message.reply_text(
+            "Usage: <code>/channel https://www.youtube.com/@handle</code>", parse_mode="HTML"
+        )
+        return
+    await _route_channel(message, channel_url)
+
+
+async def cmd_viral(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+    payload_text = _command_payload(message, "/viral") or " ".join(context.args or [])
+    video_id = extract_video_id(payload_text)
+    channel_url = extract_channel_url(payload_text)
+    if not video_id and not channel_url:
+        await message.reply_text("Usage: <code>/viral https://youtu.be/VIDEO_ID</code>", parse_mode="HTML")
+        return
+    await _send_viral_message(message, video_id, channel_url)
+
+
+async def cmd_similar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+    payload_text = _command_payload(message, "/similar") or " ".join(context.args or [])
+    video_id = extract_video_id(payload_text)
+    channel_url = extract_channel_url(payload_text)
+    if not video_id and not channel_url:
+        await message.reply_text("Usage: <code>/similar https://youtu.be/VIDEO_ID</code>", parse_mode="HTML")
+        return
+    await _send_similar_message(message, video_id, channel_url)
+
+
+async def _send_viral_message(
+    message: Message, video_id: str | None, channel_url: str | None = None
+) -> None:
+    from recommender import viral_videos
+
+    target = channel_url or f"https://www.youtube.com/watch?v={video_id}"
+    status = await message.reply_text("🔥 Scanning the channel for its top 5 viral videos…")
+    try:
+        result = await asyncio.to_thread(viral_videos, target, 5)
+    except Exception as exc:
+        await status.edit_text(f"❌ Viral scan failed: {exc}")
+        return
+    videos = result.get("videos") or []
+    if not videos:
+        await status.edit_text("❌ No long-form videos found on that channel.")
+        return
+    lines = [f"🔥 <b>Top {len(videos)} viral videos</b> — {html.escape(str(result['channel'].get('name') or ''))}", ""]
+    for index, video in enumerate(videos, 1):
+        lines.append(
+            f"{index}. <a href=\"{video['url']}\">{html.escape(str(video['title'])[:90])}</a> — "
+            f"{_fmt_int(video.get('views'))} views"
+        )
+    lines += ["", "Use the buttons below or /channel to go deeper."]
+    await status.edit_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=reply_buttons(video_id) if video_id else mode_keyboard(),
+    )
+
+
+async def _send_similar_message(
+    message: Message, video_id: str | None, channel_url: str | None = None
+) -> None:
+    from recommender import similar_channels
+
+    target = channel_url or f"https://www.youtube.com/watch?v={video_id}"
+    status = await message.reply_text("🔎 Finding peer channels in the same niche…")
+    try:
+        result = await asyncio.to_thread(similar_channels, target, 6)
+    except Exception as exc:
+        await status.edit_text(f"❌ Similar-channel search failed: {exc}")
+        return
+    peers = result.get("channels") or []
+    if not peers:
+        await status.edit_text("❌ No similar channels found.")
+        return
+    lines = [
+        f"🧭 <b>Similar channels</b> (query: {html.escape(str(result.get('query') or ''))})",
+        "",
+    ]
+    for index, peer in enumerate(peers, 1):
+        link = peer.get("channel_url") or ""
+        label = html.escape(str(peer.get("name") or "Unknown"))
+        handle = html.escape(str(peer.get("handle") or ""))
+        if link:
+            lines.append(f"{index}. <a href=\"{link}\">{label}</a> {handle}")
+        else:
+            lines.append(f"{index}. {label} {handle}")
+    await status.edit_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=reply_buttons(video_id) if video_id else mode_keyboard(),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Mode-aware routing
+# --------------------------------------------------------------------------- #
+async def _route_single_video(message: Message, video_id: str) -> None:
+    if not video_id:
+        await message.reply_text("Usage: <code>/video https://youtu.be/VIDEO_ID</code>", parse_mode="HTML")
+        return
+    if execution_mode.route_job("single") == "cloud":
+        await _handle_cloud_batch(
+            message, [], [f"https://www.youtube.com/watch?v={video_id}"]
+        )
+    else:
+        await process_smart_video(message, video_id)
+
+
+async def _route_channel(message: Message, channel_url: str) -> None:
+    if not channel_url:
+        await message.reply_text("Usage: <code>/channel https://www.youtube.com/@handle</code>", parse_mode="HTML")
+        return
+    if execution_mode.route_job("channel") == "cloud":
+        await _handle_cloud_batch(message, [channel_url], [])
+    else:
+        await process_channel(message, channel_url)
+
+
+async def _route_batch(message: Message, channels: list[str], videos: list[str]) -> None:
+    if not channels and not videos:
+        await message.reply_text(
+            "Send <code>/batch</code> followed by channel/video links, or paste 2+ links.",
+            parse_mode="HTML",
+            reply_markup=mode_keyboard(),
+        )
+        return
+    if execution_mode.route_job("batch") == "cloud":
+        await _handle_cloud_batch(message, channels, videos)
+    else:
+        await _run_render_batch(message, channels, videos)
+
+
+async def _run_render_batch(message: Message, channels: list[str], videos: list[str]) -> None:
+    """RENDER mode: execute the whole batch on this instance."""
+    status = await message.reply_text(
+        "🖥️ <b>Render mode</b> — running the batch on this instance "
+        "(live Thinking card follows).",
+        parse_mode="HTML",
+    )
+    token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+
+    def work():
+        import batch_runner
+
+        client = batch_runner.TelegramClient(
+            token, str(message.chat_id or telegram_chat_id())
+        )
+        ui = batch_runner.LiveBatchUI(client, len(channels), len(videos))
+        ui.start()
+        return batch_runner.run_batch(ui, channels, videos)
+
+    try:
+        summary = await asyncio.to_thread(work)
+        await status.edit_text(
+            f"✅ Batch complete on Render: {len(summary.channels)} channel(s), "
+            f"{len(summary.standalone)} standalone video(s), "
+            f"{summary.total_videos} videos."
+        )
+    except Exception as exc:
+        logger.exception("Render batch failed")
+        await status.edit_text(f"❌ Render batch failed: {str(exc)[:300]}")
+
+
+# --------------------------------------------------------------------------- #
+# Smart single-video pipeline (metadata + channel DP/banner + AI + viral + similar)
+# --------------------------------------------------------------------------- #
+def _video_thumbnail_url(info: dict[str, Any], video_id: str) -> str:
+    return str(info.get("thumbnail") or thumbnail_url_for(video_id))
+
+
+def build_smart_video_bundle(
+    video_id: str, progress: Callable[[str], None] | None = None
+) -> dict[str, Any]:
+    """Blocking smart single-video pipeline (runs in a worker thread)."""
+    from recommender import resolve_channel, similar_channels, viral_videos
+
+    def note(message: str) -> None:
+        if progress is not None:
+            progress(message)
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    watch_url = f"https://www.youtube.com/watch?v={video_id}"
+    note("Fetching video metadata with yt-dlp")
+    info = fetch_metadata(watch_url)
+    item = build_channel_item(
+        info,
+        "Video",
+        own_handles=(),
+        collaboration_source=info,
+        video_id=video_id,
+        captions=_caption_tracks(info),
+    )
+    video_stem = safe_stem(item.title, "Video")
+    note("Downloading HD thumbnail")
+    thumb_path, _thumb_url = download_thumbnail(
+        video_id, info, OUTPUT_DIR / f"{video_stem}_{video_id}_thumb.jpg"
+    )
+    note("Fetching transcript (API → yt-dlp captions → Gemini audio backup)")
+    transcript = fetch_transcript(video_id, _caption_tracks(info))
+    audio_used = False
+    if not transcript.strip() and ai_analyzer.available():
+        note("No captions found — Gemini audio transcription backup")
+        transcript = ai_analyzer.transcribe_video_audio(video_id)
+        audio_used = bool(transcript)
+    item.transcript = transcript
+    note("Fetching all comments")
+    item.comments = fetch_comments(watch_url)
+
+    note("Parent channel overview, DP and banner")
+    profile = None
+    avatar_file = ""
+    banner_file = ""
+    channel_url = ""
+    try:
+        channel = resolve_channel(watch_url)
+        channel_url = str(channel.get("channel_url") or "")
+        if channel_url:
+            listing, _ = fetch_channel_listing(channel_url, "videos", 1)
+            about_data = fetch_channel_about(channel_url)
+            profile = build_channel_profile(channel_url, listing, about_data)
+            channel_stem = safe_stem(profile.name, "Channel")
+            avatar_src = download_avatar(profile.avatar_url, OUTPUT_DIR)
+            if avatar_src:
+                avatar_target = OUTPUT_DIR / f"{channel_stem}_avatar.jpg"
+                shutil.copyfile(avatar_src, avatar_target)
+                avatar_file = avatar_target.name
+            banner_url = channel_banner_url(listing, about_data)
+            banner_target = download_channel_banner(
+                banner_url, OUTPUT_DIR / f"{channel_stem}_banner.jpg"
+            )
+            if banner_target is not None:
+                banner_file = banner_target.name
+    except Exception as exc:
+        logger.warning("Channel enrichment failed: %s", exc)
+
+    note("Gemini Hook Analysis + Audience Pulse (no summary)")
+    hook = (
+        ai_analyzer.analyze_hook_and_pulse(transcript, item.comments)
+        if ai_analyzer.available()
+        else {"skipped": True, "reason": "no AI key"}
+    )
+    note("Finding the top 5 viral videos")
+    try:
+        viral = viral_videos(watch_url, 5)
+    except Exception as exc:
+        viral = {"channel": {}, "videos": [], "error": str(exc)[:160]}
+    note("Finding similar channels")
+    try:
+        similar = similar_channels(watch_url, 6)
+    except Exception as exc:
+        similar = {"channels": [], "error": str(exc)[:160]}
+
+    markdown_path = OUTPUT_DIR / f"{video_stem}_{video_id}_Intel.md"
+    markdown_path.write_text(
+        build_smart_video_markdown(
+            item,
+            profile,
+            hook,
+            viral,
+            similar,
+            thumb_path.name if thumb_path else "",
+            avatar_file,
+            banner_file,
+            audio_used,
+        ),
+        encoding="utf-8",
+    )
+    return {
+        "item": item,
+        "profile": profile,
+        "channel_url": channel_url,
+        "hook": hook,
+        "viral": viral,
+        "similar": similar,
+        "thumb_path": thumb_path,
+        "avatar_path": OUTPUT_DIR / avatar_file if avatar_file else None,
+        "banner_path": OUTPUT_DIR / banner_file if banner_file else None,
+        "markdown_path": markdown_path,
+        "audio_used": audio_used,
+    }
+
+
+def build_smart_video_markdown(
+    item: ChannelItem,
+    profile: ChannelProfile | None,
+    hook: dict[str, Any],
+    viral: dict[str, Any],
+    similar: dict[str, Any],
+    thumb_file: str,
+    avatar_file: str,
+    banner_file: str,
+    audio_used: bool,
+) -> str:
+    lines = [f"# {item.title}", ""]
+    if thumb_file:
+        lines += [f"![Thumbnail](./{thumb_file})", ""]
+    lines += [
+        "## 📊 Video Details",
+        "",
+        "| Field | Value |",
+        "| --- | --- |",
+        f"| URL | {item.url} |",
+        f"| Uploaded | {item.upload_date} |",
+        f"| Views / Likes | {_fmt_int(item.views)} / {_fmt_int(item.likes)} |",
+        f"| Comments | {_fmt_int(item.comment_count)} (all fetched) |",
+        f"| Duration | {_fmt_duration(item.duration_sec)} |",
+        f"| Category | {item.category or 'N/A'} |",
+        f"| Tags | {', '.join(item.tags) if item.tags else 'N/A'} |",
+        f"| Collaborations | {item.collaborations or 'None detected'} |",
+        f"| Transcript source | {'Gemini audio transcription' if audio_used else 'captions'} |",
+        "",
+    ]
+    if profile is not None:
+        lines += ["## 📺 Parent Channel", ""]
+        if avatar_file:
+            lines += [f"![Channel DP](./{avatar_file})", ""]
+        if banner_file:
+            lines += [f"![Channel Banner](./{banner_file})", ""]
+        lines += [
+            "| Field | Value |",
+            "| --- | --- |",
+            f"| Name | {profile.name} |",
+            f"| Handle | {profile.handle or 'N/A'} |",
+            f"| URL | {profile.url} |",
+            f"| Subscribers | {profile.subscribers_text} |",
+            f"| Total Views | {profile.total_views_text} |",
+            f"| Joined / Country | {profile.joined_date or 'N/A'} / {profile.country or 'N/A'} |",
+            "",
+        ]
+    lines += ["## 🎯 AI Hook Analysis", ""]
+    hook_data = hook.get("hook") if isinstance(hook, dict) else None
+    audience = hook.get("audience") if isinstance(hook, dict) else None
+    if isinstance(hook_data, dict):
+        lines += [
+            f"- **Hook type:** {hook_data.get('type', 'N/A')}",
+            f"- **Strength:** {hook_data.get('strength', 'N/A')}/10",
+            f"- **Analysis:** {hook_data.get('analysis', 'N/A')}",
+        ]
+    elif hook:
+        lines.append(f"- _{hook.get('error') or hook.get('reason') or 'AI analysis unavailable'}_")
+    lines += ["", "## 👥 Audience Pulse", ""]
+    if isinstance(audience, dict):
+        lines += [
+            f"- **Sentiment:** {audience.get('sentiment', 'N/A')}",
+            f"- **Top themes:** {', '.join(audience.get('top_themes') or []) or 'N/A'}",
+            f"- **Insight:** {audience.get('notable_insight', 'N/A')}",
+        ]
+    else:
+        lines.append("_No audience pulse available._")
+    lines += ["", "## 🗣️ Full Transcript", "", item.transcript or "_Transcript unavailable._", ""]
+    lines += [f"## 💬 Comments ({len(item.comments):,})", "", format_comments(item.comments) or "_No comments._", ""]
+    lines += ["## 🔥 Top 5 Viral Videos (this channel)", ""]
+    viral_videos_list = viral.get("videos") or []
+    if viral_videos_list:
+        for rank, video in enumerate(viral_videos_list, 1):
+            lines.append(
+                f"{rank}. [{video.get('title', '')}]({video.get('url', '')}) — "
+                f"{_fmt_int(video.get('views'))} views"
+            )
+    else:
+        lines.append(f"_No viral data ({viral.get('error', 'unavailable')})._")
+    lines += ["", "## 🧭 Similar Channels", ""]
+    peers = similar.get("channels") or []
+    if peers:
+        for rank, peer in enumerate(peers, 1):
+            handle = peer.get("handle") or ""
+            channel_link = peer.get("channel_url") or ""
+            lines.append(f"{rank}. [{peer.get('name', 'Unknown')}]({channel_link}) {handle}")
+    else:
+        lines.append(f"_No similar channels ({similar.get('error', 'unavailable')})._")
+    lines.append("")
+    return "\n".join(lines)
+
+
+async def process_smart_video(message: Message, video_id: str) -> None:
+    card = ProgressCard(
+        title=f"🧠 Smart Video Intelligence — {video_id}",
+        steps=[
+            "Link Received",
+            "Video metadata, HD thumbnail, transcript & comments",
+            "Parent channel (DP + banner)",
+            "AI hook/pulse + viral + similar",
+            "Delivering to Telegram",
+        ],
+    )
+    card.finish_step(0)
+    card.start_step(1)
+    card.set_state("🔍 Running the smart video pipeline…")
+    status = await message.reply_text(
+        card.render(), parse_mode="HTML", disable_web_page_preview=True
+    )
+    live = LiveStatus(status, card)
+    try:
+        bundle = await _run_with_live_progress(
+            lambda progress: build_smart_video_bundle(video_id, progress), live
+        )
+        card.finish_step(1)
+        card.finish_step(2)
+        card.finish_step(3)
+        card.start_step(4)
+        card.set_state("📤 Delivering photos, dossier and buttons…")
+        await live.edit(force=True)
+
+        item: ChannelItem = bundle["item"]
+        profile = bundle.get("profile")
+        caption = (
+            f"<b>{html.escape(item.title[:300])}</b>\n"
+            f"👁 {_fmt_int(item.views)} views · 👍 {_fmt_int(item.likes)} likes · "
+            f"💬 {_fmt_int(item.comment_count)} comments\n"
+            f"🗣 Transcript: {len(item.transcript):,} chars\n"
+            f"📺 {html.escape(profile.name if profile else '')}"
+        )
+        if bundle.get("thumb_path"):
+            await _send_photo_safe(
+                message, bundle["thumb_path"], caption, reply_buttons(video_id)
+            )
+        if profile is not None:
+            channel_caption = (
+                f"📺 <b>{html.escape(profile.name)}</b>\n"
+                f"👥 {html.escape(profile.subscribers_text)} · "
+                f"👁 {html.escape(profile.total_views_text)}"
+            )
+            if bundle.get("avatar_path"):
+                await _send_photo_safe(message, bundle["avatar_path"], channel_caption)
+            if bundle.get("banner_path"):
+                await _send_photo_safe(message, bundle["banner_path"], "🖼 Channel banner")
+
+        doc_caption = (
+            f"📄 Smart dossier for <b>{html.escape(item.title[:120])}</b>\n"
+            f"🎯 Hook + audience pulse · 🔥 {len(bundle['viral'].get('videos') or [])} viral videos · "
+            f"🧭 {len(bundle['similar'].get('channels') or [])} similar channels\n"
+            f"💾 Saved: <code>{html.escape(str(bundle['markdown_path']))}</code>"
+        )
+        await _send_document_with_retry(
+            message, bundle["markdown_path"], doc_caption, reply_buttons(video_id)
+        )
+        card.finish_step(4)
+        card.set_state(f"✅ Completed in {card.elapsed_text()}")
+        card.add_trace("Delivered: HD thumbnail, DP, banner, dossier + inline buttons")
+        await live.edit(force=True)
+    except Exception as exc:
+        logger.exception("Smart video pipeline failed")
+        live.mark_failed(exc)
+        await live.edit(force=True)
+
+
+# --------------------------------------------------------------------------- #
+# Render.com health endpoint + plugin API
 # --------------------------------------------------------------------------- #
 def health_port() -> int:
     try:
@@ -2538,25 +3292,52 @@ def health_port() -> int:
 
 
 class HealthHandler(BaseHTTPRequestHandler):
-    """Minimal 200 OK endpoint so Render Web Service + UptimeRobot stay happy."""
+    """Health endpoint (/health) + OpenAPI plugin endpoints (/openapi.json, /api/*)."""
 
-    server_version = "YTBotHealth/1.0"
+    server_version = "YTBotHealth/2.0"
 
-    def _ok(self, send_body: bool = True) -> None:
-        payload = json.dumps({"status": "alive"}).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(payload)))
+    def _json(self, status: int, payload: dict[str, Any], send_body: bool = True) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         if send_body:
-            self.wfile.write(payload)
+            self.wfile.write(body)
+
+    def _ok(self, send_body: bool = True) -> None:
+        self._json(200, {"status": "alive"}, send_body)
+
+    def _plugin(self, method: str) -> bool:
+        try:
+            import plugin_api  # lazy import avoids the bot<->plugin import cycle
+
+            path = self.path.split("?")[0]
+            if not plugin_api.is_plugin_path(path):
+                return False
+            length = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(length) if length else b""
+            status, payload = plugin_api.handle_request(method, path, self.headers, body)
+            self._json(status, payload)
+            return True
+        except Exception as exc:  # never break the health server
+            logger.exception("Plugin endpoint failed: %s", exc)
+            self._json(500, {"error": str(exc)[:300]})
+            return True
 
     def do_GET(self) -> None:  # noqa: N802 - http.server API
         if self.path.split("?")[0] in ("/", "/health", "/ping"):
             self._ok()
-        else:
-            self.send_error(404)
+            return
+        if self._plugin("GET"):
+            return
+        self.send_error(404)
+
+    def do_POST(self) -> None:  # noqa: N802 - http.server API
+        if self._plugin("POST"):
+            return
+        self.send_error(404)
 
     def do_HEAD(self) -> None:  # noqa: N802 - http.server API
         if self.path.split("?")[0] in ("/", "/health", "/ping"):
@@ -2619,16 +3400,26 @@ def load_token() -> str:
     return token
 
 
-def main() -> None:
-    token = load_token()
+def _build_application(token: str) -> Application:
+    """Build the PTB application with all commands + the LOCAL-standby guard."""
 
-    port = health_port()
-    health_server: ThreadingHTTPServer | None = None
-    try:
-        health_server = start_health_server(port)
-        print(f"[YT-Bot] Health server listening on 0.0.0.0:{port} (/, /health, /ping)")
-    except OSError as exc:  # port busy locally: polling should still work
-        logger.warning("Health server could not bind port %s: %s", port, exc)
+    async def post_init(application: Application) -> None:
+        async def guard_loop() -> None:
+            while True:
+                await asyncio.sleep(30)
+                try:
+                    remote = await asyncio.to_thread(execution_mode.fetch_remote_mode)
+                except Exception:
+                    remote = None
+                if remote:
+                    execution_mode.save_local_mode(remote)
+                active = remote or execution_mode.current_mode()
+                if execution_mode.standby_required(active):
+                    logger.info("Execution mode is LOCAL: stopping listener for standby")
+                    await application.stop()
+                    return
+
+        asyncio.get_running_loop().create_task(guard_loop())
 
     application = (
         Application.builder()
@@ -2640,21 +3431,76 @@ def main() -> None:
         # keep it in sync with write_timeout instead of the 20s default.
         .media_write_timeout(TELEGRAM_WRITE_TIMEOUT)
         .pool_timeout(TELEGRAM_POOL_TIMEOUT)
+        .post_init(post_init)
         .build()
     )
     application.add_handler(CommandHandler(["start", "help"], cmd_start))
+    application.add_handler(CommandHandler("mode", cmd_mode))
     application.add_handler(CommandHandler("batch", cmd_batch))
+    application.add_handler(CommandHandler("video", cmd_video))
+    application.add_handler(CommandHandler("channel", cmd_channel_links))
+    application.add_handler(CommandHandler("viral", cmd_viral))
+    application.add_handler(CommandHandler("similar", cmd_similar))
+    application.add_handler(CallbackQueryHandler(on_callback))
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_youtube_link)
     )
+    return application
 
-    single_mode = "cloud" if cloud_single_links_enabled() else "local"
-    print(
-        f"[YT-Bot] Running ({single_mode} single-link mode). Send a YouTube link, or "
-        "/batch + links for the cloud batch. Ctrl+C to stop."
-    )
+
+def _wait_for_mode_change() -> None:
+    """Block in polite standby until /mode is switched away from LOCAL."""
+    while True:
+        time.sleep(30)
+        try:
+            remote = execution_mode.fetch_remote_mode()
+        except Exception:
+            remote = None
+        if remote:
+            execution_mode.save_local_mode(remote)
+        local = execution_mode.load_local_mode()
+        if local and not execution_mode.standby_required(local):
+            logger.info("Execution mode changed to %s: waking up", local)
+            return
+
+
+def main() -> None:
+    token = load_token()
+    mode = execution_mode.resolve_mode()
+    execution_mode.save_local_mode(mode)
+
+    port = health_port()
+    health_server: ThreadingHTTPServer | None = None
     try:
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
+        health_server = start_health_server(port)
+        print(
+            f"[YT-Bot] Health server listening on 0.0.0.0:{port} "
+            "(/, /health, /ping, /openapi.json, /api/*)"
+        )
+    except OSError as exc:  # port busy locally: polling should still work
+        logger.warning("Health server could not bind port %s: %s", port, exc)
+
+    try:
+        while True:
+            mode = execution_mode.current_mode()
+            if execution_mode.standby_required(mode):
+                print(
+                    "[YT-Bot] Execution mode LOCAL: polite polling standby. "
+                    "Your local PC owns the bot; waiting for /mode change…"
+                )
+                _wait_for_mode_change()
+                continue
+            print(
+                f"[YT-Bot] Running · engine {execution_mode.mode_label(mode)} "
+                f"({execution_mode.describe_mode(mode)}). Ctrl+C to stop."
+            )
+            application = _build_application(token)
+            try:
+                application.run_polling(allowed_updates=Update.ALL_TYPES)
+            except KeyboardInterrupt:
+                raise
+            if not execution_mode.standby_required(execution_mode.current_mode()):
+                break
     finally:
         if health_server is not None:
             health_server.shutdown()

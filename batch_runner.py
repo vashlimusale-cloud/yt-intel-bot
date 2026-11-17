@@ -45,6 +45,7 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 import bot as yt_bot  # noqa: E402  (reuses the scraping pipeline helpers)
+import ai_analyzer  # noqa: E402
 import categorizer  # noqa: E402
 from progress import ProgressCard  # noqa: E402
 
@@ -461,6 +462,8 @@ class FullChannel:
     xlsx_path: Path
     md_path: Path
     avatar_path: Path | None = None
+    banner_path: Path | None = None
+    banner_url: str = ""
     elapsed: float = 0.0
 
     @property
@@ -548,6 +551,13 @@ def _enrich_item(
         except Exception as exc:  # transcripts are best-effort
             logger.warning("Transcript unavailable for %s: %s", video_id, exc)
             ui.trace(f"⚠️ {kind} {index}/{total}: transcript unavailable ({str(exc)[:60]})")
+        if not transcript.strip() and ai_analyzer.available():
+            try:
+                transcript = ai_analyzer.transcribe_video_audio(video_id)
+                if transcript:
+                    ui.trace(f"🎧 {kind} {index}/{total}: Gemini audio transcription backup")
+            except Exception as exc:
+                logger.warning("Audio transcription failed for %s: %s", video_id, exc)
         has_comments = item.comment_count != 0
         if has_comments:
             try:
@@ -580,9 +590,9 @@ def audit_channel_full(url: str, ui: LiveBatchUI) -> FullChannel:
         base_url, "videos", MAX_CHANNEL_VIDEOS
     )
     resolved_url = yt_bot._resolve_channel_base(base_url, listing)
-    profile = yt_bot.build_channel_profile(
-        resolved_url, listing, yt_bot.fetch_channel_about(resolved_url)
-    )
+    about_data = yt_bot.fetch_channel_about(resolved_url)
+    profile = yt_bot.build_channel_profile(resolved_url, listing, about_data)
+    banner_url = yt_bot.channel_banner_url(listing, about_data)
     own_handles = tuple(
         handle for handle in (profile.handle, profile.channel_id) if handle
     )
@@ -622,10 +632,14 @@ def audit_channel_full(url: str, ui: LiveBatchUI) -> FullChannel:
     thumbnails_dir.mkdir(parents=True, exist_ok=True)
     avatar_name = f"{channel_stem}_avatar.jpg"
     avatar_path = download_channel_avatar(profile, folder / avatar_name)
+    banner_name = f"{channel_stem}_banner.jpg"
+    banner_path = yt_bot.download_channel_banner(banner_url, folder / banner_name)
     if avatar_path:
         ui.trace(f"🖼 Avatar saved: {category.category}/{channel_stem}/{avatar_name}")
-    else:
-        ui.trace(f"⚠️ No avatar could be downloaded for {profile.name}")
+    if banner_path:
+        ui.trace(f"🖼 Banner saved: {category.category}/{channel_stem}/{banner_name}")
+    if not avatar_path and not banner_path:
+        ui.trace(f"⚠️ No avatar/banner could be downloaded for {profile.name}")
     ui.update()
 
     ui.trace(
@@ -658,6 +672,27 @@ def audit_channel_full(url: str, ui: LiveBatchUI) -> FullChannel:
         ui.trace(f"🤝 Collaborators detected: {', '.join(collaborators[:8])}")
     ui.update()
 
+    if ai_analyzer.available():
+        ui.trace(f"🤖 Gemini hook/audience analysis in groups of {ai_analyzer.BATCH_GROUP_SIZE}")
+        items_for_ai = videos + shorts
+        payload = [
+            {
+                "title": item.title,
+                "views": item.views,
+                "likes": item.likes,
+                "comment_count": item.comment_count,
+                "transcript": item.transcript,
+                "top_comment": (item.comments[0].get("text") if item.comments else ""),
+            }
+            for item in items_for_ai
+        ]
+        analyses = ai_analyzer.analyze_videos_batch(payload)
+        for item, analysis in zip(items_for_ai, analyses):
+            item.ai = analysis
+        ui.trace(f"🤖 AI analysed {sum(1 for item in items_for_ai if item.ai)} item(s)")
+    else:
+        ui.trace("🤖 AI skipped (GEMINI_API_KEY / OPENROUTER_API_KEY not set)")
+
     xlsx_path = folder / f"{channel_stem}_Full_Intel.xlsx"
     md_path = folder / f"{channel_stem}_Full_Intel.md"
     write_full_channel_workbook(
@@ -668,6 +703,8 @@ def audit_channel_full(url: str, ui: LiveBatchUI) -> FullChannel:
         category,
         xlsx_path,
         avatar_file=avatar_name if avatar_path else "",
+        banner_file=banner_name if banner_path else "",
+        banner_url=banner_url,
     )
     md_path.write_text(
         build_full_channel_markdown(
@@ -677,6 +714,8 @@ def audit_channel_full(url: str, ui: LiveBatchUI) -> FullChannel:
             posts,
             category,
             avatar_file=avatar_name if avatar_path else "",
+            banner_file=banner_name if banner_path else "",
+            banner_url=banner_url,
         ),
         encoding="utf-8",
     )
@@ -697,6 +736,8 @@ def audit_channel_full(url: str, ui: LiveBatchUI) -> FullChannel:
         xlsx_path=xlsx_path,
         md_path=md_path,
         avatar_path=avatar_path,
+        banner_path=banner_path,
+        banner_url=banner_url,
         elapsed=time.monotonic() - started,
     )
 
@@ -844,6 +885,16 @@ def _md_table_row(cells: list[Any]) -> str:
 # --------------------------------------------------------------------------- #
 # Full channel workbook / markdown
 # --------------------------------------------------------------------------- #
+def _ai_columns(item: Any) -> list[Any]:
+    ai = getattr(item, "ai", None) or {}
+    return [
+        ai.get("hook_type", ""),
+        ai.get("hook_strength", ""),
+        ai.get("audience_sentiment", ""),
+        ai.get("recommendation", ""),
+    ]
+
+
 def write_full_channel_workbook(
     profile: Any,
     videos: list[Any],
@@ -853,6 +904,8 @@ def write_full_channel_workbook(
     dest: Path,
     *,
     avatar_file: str = "",
+    banner_file: str = "",
+    banner_url: str = "",
 ) -> Path:
     """`<Channel>_Full_Intel.xlsx` with overview, videos, shorts, posts tabs."""
     if not yt_bot.OPENPYXL_AVAILABLE:
@@ -864,10 +917,13 @@ def write_full_channel_workbook(
         ["Channel", "Detected Sub-Niche", category.sub_niche],
         ["Channel", "Category Confidence", category.confidence],
         ["Channel", "Channel Avatar File", avatar_file or profile.avatar_url or "N/A"],
+        ["Channel", "Banner URL", banner_url or "N/A"],
+        ["Channel", "Banner File", banner_file or "N/A"],
     ] + yt_bot._overview_rows(profile, videos + shorts, posts, collaborators)
     overview_rows.append(["SEO Summary", "Transcripts Collected", sum(1 for i in videos + shorts if i.transcript)])
     overview_rows.append(["SEO Summary", "Comments Collected", sum(len(i.comments) for i in videos + shorts)])
     overview_rows.append(["SEO Summary", "Thumbnails Downloaded", sum(1 for i in videos + shorts if getattr(i, "thumbnail_file", ""))])
+    overview_rows.append(["SEO Summary", "AI Analysed Items", sum(1 for i in videos + shorts if getattr(i, "ai", None))])
 
     workbook = yt_bot.Workbook()
     overview = workbook.active
@@ -886,6 +942,7 @@ def write_full_channel_workbook(
         "Title", "Video_URL", "Upload_Date", "Views", "Likes", "Comment_Count",
         "Duration_Sec", "Category", "Tags", "Collaborations_Detected",
         "Thumbnail_URL", "Thumbnail_File", "Description", "Full_Transcript", "Top_Comments",
+        "AI_Hook_Type", "AI_Hook_Strength", "AI_Audience_Sentiment", "AI_Recommendation",
     ]
     video_rows = [
         [
@@ -894,6 +951,7 @@ def write_full_channel_workbook(
             item.collaborations, getattr(item, "thumbnail_url", ""),
             getattr(item, "thumbnail_file", ""), _cell(item.description),
             _cell(item.transcript), format_comments_cell(item.comments),
+            *_ai_columns(item),
         ]
         for item in videos
     ]
@@ -908,6 +966,7 @@ def write_full_channel_workbook(
         "Title", "Shorts_URL", "Upload_Date", "Views", "Likes", "Comment_Count",
         "Duration_Sec", "Tags", "Collaborations_Detected",
         "Thumbnail_URL", "Thumbnail_File", "Description", "Full_Transcript", "Top_Comments",
+        "AI_Hook_Type", "AI_Hook_Strength", "AI_Audience_Sentiment", "AI_Recommendation",
     ]
     short_rows = [
         [
@@ -916,6 +975,7 @@ def write_full_channel_workbook(
             item.collaborations, getattr(item, "thumbnail_url", ""),
             getattr(item, "thumbnail_file", ""), _cell(item.description),
             _cell(item.transcript), format_comments_cell(item.comments),
+            *_ai_columns(item),
         ]
         for item in shorts
     ]
@@ -957,12 +1017,17 @@ def build_full_channel_markdown(
     category: categorizer.CategoryResult,
     *,
     avatar_file: str = "",
+    banner_file: str = "",
+    banner_url: str = "",
 ) -> str:
     collaborators = yt_bot.collect_collaborators(videos + shorts, posts)
     lines: list[str] = [f"# {profile.name}", ""]
     avatar_link = f"./{avatar_file}" if avatar_file else profile.avatar_url
     if avatar_link:
         lines += [f"![Channel Avatar]({avatar_link})", ""]
+    banner_link = f"./{banner_file}" if banner_file else banner_url
+    if banner_link:
+        lines += [f"![Channel Banner]({banner_link})", ""]
     lines += [
         f"**Niche:** {category.category} / {category.sub_niche} "
         f"(score {category.score}, {category.source}, confidence {category.confidence})",
@@ -1017,6 +1082,13 @@ def build_full_channel_markdown(
         )
         if thumbnail:
             lines += [f"![Thumbnail]({thumbnail})", ""]
+        if getattr(item, "ai", None):
+            lines += [
+                f"- **AI:** {item.ai.get('hook_type', '?')} hook "
+                f"({item.ai.get('hook_strength', '?')}/10) · audience "
+                f"{item.ai.get('audience_sentiment', '?')} · {item.ai.get('recommendation', '')}",
+                "",
+            ]
         lines += ["**Transcript**", "", item.transcript or "_Transcript unavailable._", ""]
         lines += [f"**Top {len(item.comments)} Comments**", ""]
         lines += [format_comments_markdown(item.comments), ""]
@@ -1038,6 +1110,13 @@ def build_full_channel_markdown(
             thumbnail = _thumbnail_for(item.url)
             if thumbnail:
                 lines += [f"![Thumbnail]({thumbnail})", ""]
+            if getattr(item, "ai", None):
+                lines += [
+                    f"- **AI:** {item.ai.get('hook_type', '?')} hook "
+                    f"({item.ai.get('hook_strength', '?')}/10) · audience "
+                    f"{item.ai.get('audience_sentiment', '?')} · {item.ai.get('recommendation', '')}",
+                    "",
+                ]
             lines += ["**Transcript**", "", item.transcript or "_Transcript unavailable._", ""]
             lines += [f"**Top {len(item.comments)} Comments**", ""]
             lines += [format_comments_markdown(item.comments), ""]
@@ -1115,7 +1194,8 @@ OVERVIEW_HEADERS = [
     "Subscribers", "Total_Views", "Videos_Fetched", "Shorts_Fetched", "Posts_Fetched",
     "Transcripts", "Comments_Collected", "Collaborations_Count", "Collaborators",
     "Avg_Views_Video", "Avg_Views_Short", "Joined_Date", "Country", "Public_Email",
-    "Channel_URL", "Avatar_File", "Excel_File", "Markdown_File",
+    "Channel_URL", "Avatar_File", "Banner_URL", "Banner_File",
+    "Excel_File", "Markdown_File",
 ]
 
 
@@ -1157,6 +1237,8 @@ def overview_row(channel: FullChannel) -> list[Any]:
         profile.email,
         profile.url,
         channel.avatar_path.name if channel.avatar_path else "",
+        channel.banner_url or "",
+        channel.banner_path.name if channel.banner_path else "",
         _relative_path(channel.xlsx_path),
         _relative_path(channel.md_path),
     ]
@@ -1174,7 +1256,7 @@ def build_master_workbook(
     rows = [overview_row(channel) for channel in channels]
     yt_bot._write_table(
         overview, OVERVIEW_HEADERS, rows,
-        wrap_columns=(1, 15, 23), caps={1: 34, 2: 24, 15: 46, 23: 60},
+        wrap_columns=(1, 15, 23), caps={1: 34, 2: 24, 15: 46, 23: 60, 24: 60},
     )
 
     for category in sorted({channel.category.category for channel in channels}):
@@ -1182,7 +1264,7 @@ def build_master_workbook(
         subset = [overview_row(c) for c in channels if c.category.category == category]
         yt_bot._write_table(
             sheet, OVERVIEW_HEADERS, subset,
-            wrap_columns=(1, 15, 23), caps={1: 34, 2: 24, 15: 46, 23: 60},
+            wrap_columns=(1, 15, 23), caps={1: 34, 2: 24, 15: 46, 23: 60, 24: 60},
         )
 
     if standalone:

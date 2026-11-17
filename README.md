@@ -144,3 +144,49 @@ Run: double-click `start_bot.bat`.
   block to re-read the trace.
 - **Bot silent on Render** — check the service logs, the `/health` URL, and that
   only one instance is polling the token.
+
+## Execution modes (`/mode`)
+
+Pick where jobs run (also persisted to `.mode_state.json` and mirrored to the
+GitHub repository variable `BOT_EXECUTION_MODE`):
+
+| Mode | Behaviour |
+| --- | --- |
+| ⚡ **Auto (Never Fail)** (default) | Fast single links / `/viral` / `/similar` run on the active listener; heavy `/channel` & `/batch` go to GitHub Actions; a 5-min Actions cron (`telegram_cloud_bot.yml` → `cloud_poller.py`) picks up any unhandled Telegram message older than 90 s as a failover. |
+| 🖥️ **Render Only** | 100% of jobs (single, viral, similar, channel, batch) execute on the Render instance. |
+| ☁️ **GitHub Only** | 100% of jobs are dispatched to GitHub Actions. |
+| 💻 **Local PC Only** | Render stops polling (polite standby); the local `start_bot.bat` owns every job, so there are zero Telegram 409 conflicts. Switch back with `/mode` on the local bot; Render wakes up within ~30 s. |
+
+Reply messages include an inline `⚙️ Switch Engine` button, plus
+`🔥 Extract Top 5 Viral Videos` and `📊 Extract Full Channel` shortcuts.
+
+## AI + discovery + plugins
+
+- **Gemini Flash intelligence** (`ai_analyzer.py`): Hook Analysis from the first
+  ~900 transcript chars and Audience Pulse from the top 20 comments (never video
+  summaries). When all caption tiers fail, it downloads `worstaudio` (max 15 MB),
+  transcribes with Gemini into `[MM:SS]` lines and deletes the audio. Batch mode
+  groups 10-15 videos per JSON request with 4-5 s gaps and 429 backoff; falls
+  back to `OPENROUTER_API_KEY`, then skips gracefully.
+- **Banner + DP**: every channel folder gets `<Channel>_avatar.jpg` and
+  `<Channel>_banner.jpg` (About `banner`/`mobileBanner`/`tvBanner` upgraded to
+  `=w2560`, or the widest yt-dlp channel thumbnail); both are recorded in
+  `Channel_Overview` (`Banner_URL` / `Banner_File`), embedded in the Markdown and
+  packaged in the ZIP.
+- **Recommender** (`recommender.py`): Top 5 viral videos per channel and 5-8
+  similar peer channels via `ytsearch20`.
+- **Plugin API**: `GET /openapi.json` (OpenAPI 3.1), `POST /api/smart_query`,
+  `/api/video`, `/api/channel`, `/api/similar`; optional `X-API-Key`
+  (`PLUGIN_API_KEY`). Responses stay under ChatGPT's ~50KB action limit.
+- **MCP server** (`mcp_server.py`): `smart_query`, `analyze_youtube_video`,
+  `analyze_youtube_channel`, `find_similar_channels` over stdio for Claude
+  Desktop / Claude Code / Cursor. Setup: [PLUGIN_SETUP.md](PLUGIN_SETUP.md).
+
+## Smart single-video pipeline
+
+Sending a single YouTube link (or `/video`) returns: video metadata + HD
+thumbnail `.jpg`, full `[MM:SS]` transcript, all comments, parent channel
+overview + DP `.jpg` + banner `.jpg`, Gemini Hook Analysis + Audience Pulse,
+Top 5 viral videos and 5 similar channels — plus inline buttons, with a
+`_Intel.md` dossier saved in `output/`.
+
