@@ -351,8 +351,21 @@ def _ensure_timestamps(text: str) -> str:
     return "\n".join(stamped)
 
 
+def audio_transcription_enabled() -> bool:
+    """Opt-in audio-to-text backup (off by default to keep single jobs fast)."""
+    return (os.getenv("ENABLE_AUDIO_TRANSCRIPTION") or "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def transcribe_video_audio(video_id: str) -> str:
     """Gemini Flash audio transcription backup for videos with no captions."""
+    if not audio_transcription_enabled():
+        logger.info("Audio transcription disabled (ENABLE_AUDIO_TRANSCRIPTION=false)")
+        return ""
     if not gemini_key():
         logger.info("Audio transcription skipped: GEMINI_API_KEY not set")
         return ""
@@ -367,6 +380,12 @@ def transcribe_video_audio(video_id: str) -> str:
             "max_filesize": MAX_AUDIO_BYTES,
             "retries": 2,
         }
+        try:  # reuse the decoded YOUTUBE_COOKIES_B64 file when present
+            from bot import apply_cookies
+
+            options = apply_cookies(options)
+        except Exception:
+            pass
         try:
             with yt_dlp.YoutubeDL(options) as ydl:
                 ydl.download([f"https://www.youtube.com/watch?v={video_id}"])

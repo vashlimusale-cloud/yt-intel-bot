@@ -12,6 +12,7 @@ Usage: paste your @BotFather token into `.env`, then double-click `start_bot.bat
 from __future__ import annotations
 
 import asyncio
+import base64
 import html
 import io
 import json
@@ -76,6 +77,7 @@ TOKEN_RE = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{20,}$")
 PREFERRED_LANGUAGES = ["hi", "en", "en-IN"]
 TRANSCRIPT_LANGUAGE_PRIORITY = ["hi", "en", "en-IN", "en-US", "en-GB"]
 MAX_COMMENTS = 0  # 0 = every comment; set e.g. 500 to cap very large threads
+MAX_SMART_COMMENTS = 300  # smart single-video pipeline: fast cap (env-tunable)
 MAX_CAPTION = 1024  # Telegram's hard limit for photo/document captions
 HTTP_TIMEOUT = 30
 
@@ -108,6 +110,62 @@ logging.basicConfig(
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("yt-bot")
+
+_COOKIE_FILE_LOCK = threading.Lock()
+_COOKIE_FILE_CACHE: tuple[str, str] | None = None
+
+
+def get_cookie_file() -> str | None:
+    """Decode YOUTUBE_COOKIES_B64 into <tmp>/yt_cookies.txt and return its path."""
+    global _COOKIE_FILE_CACHE
+    raw = (os.getenv("YOUTUBE_COOKIES_B64") or "").strip()
+    if not raw:
+        return None
+    with _COOKIE_FILE_LOCK:
+        if _COOKIE_FILE_CACHE and _COOKIE_FILE_CACHE[0] == raw:
+            cached = _COOKIE_FILE_CACHE[1]
+            if os.path.isfile(cached) and os.path.getsize(cached) > 0:
+                return cached
+        target = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
+        try:
+            padded = raw + "=" * (-len(raw) % 4)
+            data = base64.b64decode(padded, validate=False)
+            # Cookie exports sometimes arrive with control bytes where tabs /
+            # newlines should be (0x17/0x19 -> tab, 0x08 -> newline, stray 0xc8).
+            repaired = (
+                data.replace(b"\x17", b"\t")
+                .replace(b"\x19", b"\t")
+                .replace(b"\x08", b"\n")
+                .replace(b"\xc8", b"")
+            )
+            repaired = bytes(b for b in repaired if b in (9, 10, 13) or 32 <= b < 127)
+            lines = []
+            for line in repaired.decode("ascii", errors="ignore").splitlines():
+                if not line.strip() or line.startswith("#"):
+                    lines.append(line)
+                    continue
+                if len(line.split("\t")) >= 7:  # drop malformed cookie rows
+                    lines.append(line)
+            repaired = ("\n".join(lines) + "\n").encode("utf-8")
+            if b"\t" not in repaired or b"youtube.com" not in repaired:
+                raise ValueError("decoded data does not look like a Netscape cookie file")
+            data = repaired
+            with open(target, "wb") as handle:
+                handle.write(data)
+            _COOKIE_FILE_CACHE = (raw, target)
+            logger.info("YouTube cookies loaded (%d bytes) from YOUTUBE_COOKIES_B64", len(data))
+            return target
+        except Exception as exc:
+            logger.warning("Could not decode YOUTUBE_COOKIES_B64: %s", exc)
+            return None
+
+
+def apply_cookies(options: dict[str, Any]) -> dict[str, Any]:
+    """Attach the decoded cookie file to a yt-dlp options dict when available."""
+    cookie_file = get_cookie_file()
+    if cookie_file:
+        options["cookiefile"] = cookie_file
+    return options
 
 
 # --------------------------------------------------------------------------- #
@@ -235,7 +293,7 @@ def _resilient_opts(
         options["noplaylist"] = True
     if playlistend:
         options["playlistend"] = playlistend
-    return options
+    return apply_cookies(options)
 
 
 def _youtube_json_after(html_text: str, marker: str) -> dict[str, Any] | None:
@@ -606,17 +664,19 @@ def _pick_caption_entry(captions: dict[str, Any] | None) -> dict[str, Any] | Non
 
 def _extract_info_with_clients(video_id: str) -> dict[str, Any]:
     """Targeted yt-dlp extraction using data-centre friendly player clients."""
-    options = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "socket_timeout": HTTP_TIMEOUT,
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["tv_embedded", "android_vr", "ios", "mweb", "web"]
-            }
-        },
-    }
+    options = apply_cookies(
+        {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "socket_timeout": HTTP_TIMEOUT,
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["tv_embedded", "android_vr", "ios", "mweb", "web"]
+                }
+            },
+        }
+    )
     with yt_dlp.YoutubeDL(options) as ydl:
         info = ydl.extract_info(
             f"https://www.youtube.com/watch?v={video_id}", download=False
@@ -734,20 +794,24 @@ def _parse_caption_body(body: str, ext: str = "") -> str:
 def _subtitles_via_ytdlp(video_id: str) -> str:
     """Last resort: let yt-dlp download the caption files itself, then parse them."""
     with tempfile.TemporaryDirectory(prefix="yt_subs_") as temp_dir:
-        options = {
-            "quiet": True,
-            "no_warnings": True,
-            "skip_download": True,
-            "writesubtitles": True,
-            "writeautomaticsub": True,
-            "subtitleslangs": [*TRANSCRIPT_LANGUAGE_PRIORITY, "en-orig"],
-            "subtitlesformat": "json3/vtt",
-            "outtmpl": str(Path(temp_dir) / "%(id)s.%(ext)s"),
-            "socket_timeout": HTTP_TIMEOUT,
-            "extractor_args": {
-                "youtube": {"player_client": ["android", "ios", "tv_embedded", "web"]}
-            },
-        }
+        options = apply_cookies(
+            {
+                "quiet": True,
+                "no_warnings": True,
+                "skip_download": True,
+                "writesubtitles": True,
+                "writeautomaticsub": True,
+                "subtitleslangs": [*TRANSCRIPT_LANGUAGE_PRIORITY, "en-orig"],
+                "subtitlesformat": "json3/vtt",
+                "outtmpl": str(Path(temp_dir) / "%(id)s.%(ext)s"),
+                "socket_timeout": HTTP_TIMEOUT,
+                "extractor_args": {
+                    "youtube": {
+                        "player_client": ["tv_embedded", "android_vr", "ios", "mweb", "web"]
+                    }
+                },
+            }
+        )
         try:
             with yt_dlp.YoutubeDL(options) as ydl:
                 ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
@@ -1294,7 +1358,7 @@ def resolve_collaborator_ids(
         return
 
     labels: dict[str, str] = {}
-    options = dict(CHANNEL_LIST_OPTS)
+    options = apply_cookies(dict(CHANNEL_LIST_OPTS))
     options["playlistend"] = 1
     with yt_dlp.YoutubeDL(options) as ydl:
         for channel_id in pending[:MAX_COLLABORATOR_LOOKUPS]:
@@ -1686,7 +1750,7 @@ def fetch_items_with_details(
     def note(message: str) -> None:
         if progress is not None:
             progress(message)
-    with yt_dlp.YoutubeDL(FULL_ITEM_OPTS) as ydl:
+    with yt_dlp.YoutubeDL(apply_cookies(dict(FULL_ITEM_OPTS))) as ydl:
         for index, entry in enumerate(entries, start=1):
             video_id = str(entry["id"])
             info: dict[str, Any] | None = None
@@ -3290,7 +3354,9 @@ def _video_thumbnail_url(info: dict[str, Any], video_id: str) -> str:
 def build_smart_video_bundle(
     video_id: str, progress: Callable[[str], None] | None = None
 ) -> dict[str, Any]:
-    """Blocking smart single-video pipeline (runs in a worker thread)."""
+    """Blocking smart single-video pipeline with concurrent extraction."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     from recommender import resolve_channel, similar_channels, viral_videos
 
     def note(message: str) -> None:
@@ -3299,91 +3365,180 @@ def build_smart_video_bundle(
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     watch_url = f"https://www.youtube.com/watch?v={video_id}"
-    note("Fetching video metadata with yt-dlp")
-    info = fetch_metadata(watch_url)
-    blocked = bool(info.get("_fallback"))
-    warnings = list(info.get("_warnings") or [])
-    item = build_channel_item(
-        info,
-        "Video",
-        own_handles=(),
-        collaboration_source=info,
-        video_id=video_id,
-        captions=_caption_tracks(info),
-    )
-    video_stem = safe_stem(item.title, "Video")
-    note("Downloading HD thumbnail")
-    thumb_path, _thumb_url = download_thumbnail(
-        video_id, info, OUTPUT_DIR / f"{video_stem}_{video_id}_thumb.jpg"
-    )
-    note("Fetching transcript (API → yt-dlp captions → Gemini audio backup)")
-    transcript = fetch_transcript(video_id, _caption_tracks(info))
-    audio_used = False
-    if not transcript.strip() and ai_analyzer.available():
-        note("No captions found — Gemini audio transcription backup")
-        transcript = ai_analyzer.transcribe_video_audio(video_id)
-        audio_used = bool(transcript)
-    item.transcript = transcript
-    note("Fetching all comments")
-    item.comments = fetch_comments(watch_url)
+    started = time.monotonic()
+    note("Launching parallel extraction (metadata, transcript, comments, channel, viral, similar)")
 
-    note("Parent channel overview, DP and banner")
-    profile = None
-    avatar_file = ""
-    banner_file = ""
-    channel_url = ""
-    try:
-        channel = resolve_channel(watch_url)
-        channel_url = str(channel.get("channel_url") or "")
-        if channel_url:
+    def metadata_task() -> tuple[dict[str, Any], ChannelItem, Path | None]:
+        info = fetch_metadata(watch_url)
+        item = build_channel_item(
+            info,
+            "Video",
+            own_handles=(),
+            collaboration_source=info,
+            video_id=video_id,
+            captions=_caption_tracks(info),
+        )
+        video_stem = safe_stem(item.title, "Video")
+        thumb_path, _thumb_url = download_thumbnail(
+            video_id, info, OUTPUT_DIR / f"{video_stem}_{video_id}_thumb.jpg"
+        )
+        return info, item, thumb_path
+
+    def transcript_task() -> tuple[str, bool]:
+        transcript = fetch_transcript(video_id)
+        audio_used = False
+        if (
+            not transcript.strip()
+            and ai_analyzer.audio_transcription_enabled()
+            and ai_analyzer.available()
+        ):
+            note("No captions — Gemini audio transcription backup (enabled)")
+            transcript = ai_analyzer.transcribe_video_audio(video_id)
+            audio_used = bool(transcript)
+        return transcript, audio_used
+
+    def comments_task() -> list[dict[str, Any]]:
+        limit = int(os.getenv("MAX_SMART_COMMENTS") or MAX_SMART_COMMENTS)
+        return fetch_comments(watch_url, limit=limit or None)
+
+    def channel_task() -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "channel_url": "",
+            "profile": None,
+            "avatar_file": "",
+            "banner_file": "",
+            "blocked": False,
+            "warnings": [],
+        }
+        try:
+            channel = resolve_channel(watch_url)
+            channel_url = str(channel.get("channel_url") or "")
+            result["channel_url"] = channel_url
+            if not channel_url:
+                return result
             listing, _ = fetch_channel_listing(channel_url, "videos", 1)
-            if listing.get("_fallback"):
-                blocked = True
-                warnings.append("channel video listing blocked on this host")
             about_data = fetch_channel_about(channel_url)
             profile = build_channel_profile(channel_url, listing, about_data)
+            result["profile"] = profile
             channel_stem = safe_stem(profile.name, "Channel")
             avatar_src = download_avatar(profile.avatar_url, OUTPUT_DIR)
             if avatar_src:
                 avatar_target = OUTPUT_DIR / f"{channel_stem}_avatar.jpg"
                 shutil.copyfile(avatar_src, avatar_target)
-                avatar_file = avatar_target.name
+                result["avatar_file"] = avatar_target.name
             banner_url = channel_banner_url(listing, about_data)
             banner_target = download_channel_banner(
                 banner_url, OUTPUT_DIR / f"{channel_stem}_banner.jpg"
             )
             if banner_target is not None:
-                banner_file = banner_target.name
-    except Exception as exc:
-        logger.warning("Channel enrichment failed: %s", exc)
-        if is_datacenter_block(exc):
-            blocked = True
-            warnings.append(f"channel extraction blocked: {str(exc)[:160]}")
+                result["banner_file"] = banner_target.name
+            if listing.get("_fallback"):
+                result["blocked"] = True
+                result["warnings"].append("channel video listing blocked on this host")
+        except Exception as exc:
+            logger.warning("Channel enrichment failed: %s", exc)
+            if is_datacenter_block(exc):
+                result["blocked"] = True
+                result["warnings"].append(f"channel extraction blocked: {str(exc)[:160]}")
+        return result
 
-    note("Gemini Hook Analysis + Audience Pulse (no summary)")
+    def viral_task() -> dict[str, Any]:
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                return viral_videos(watch_url, 5)
+            except Exception as exc:
+                last_error = exc
+                if attempt == 0:
+                    time.sleep(1.5)
+        return {
+            "channel": {},
+            "videos": [],
+            "error": str(last_error)[:160],
+            "blocked": is_datacenter_block(last_error),
+        }
+
+    def similar_task() -> dict[str, Any]:
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                return similar_channels(watch_url, 6)
+            except Exception as exc:
+                last_error = exc
+                if attempt == 0:
+                    time.sleep(1.5)
+        return {
+            "channels": [],
+            "error": str(last_error)[:160],
+            "blocked": is_datacenter_block(last_error),
+        }
+
+    tasks = {
+        "metadata": metadata_task,
+        "transcript": transcript_task,
+        "comments": comments_task,
+        "channel": channel_task,
+        "viral": viral_task,
+        "similar": similar_task,
+    }
+    results: dict[str, Any] = {}
+    errors: dict[str, Exception] = {}
+    with ThreadPoolExecutor(max_workers=len(tasks), thread_name_prefix="yt-smart") as pool:
+        futures = {pool.submit(task): name for name, task in tasks.items()}
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                results[name] = future.result()
+                note(f"{name} ready")
+            except Exception as exc:
+                errors[name] = exc
+                logger.warning("Parallel task %s failed: %s", name, exc)
+
+    if "metadata" in errors:
+        raise errors["metadata"]
+    info, item, thumb_path = results["metadata"]
+    transcript, audio_used = results.get("transcript") or ("", False)
+    item.transcript = transcript
+    item.comments = results.get("comments") or []
+    channel_result = results.get("channel") or {}
+    profile = channel_result.get("profile")
+    avatar_file = channel_result.get("avatar_file") or ""
+    banner_file = channel_result.get("banner_file") or ""
+    channel_url = channel_result.get("channel_url") or ""
+    blocked = bool(info.get("_fallback"))
+    warnings = list(info.get("_warnings") or [])
+    if channel_result.get("blocked"):
+        blocked = True
+        warnings.extend(channel_result.get("warnings") or [])
+    viral = results.get("viral") or {
+        "channel": {},
+        "videos": [],
+        "error": str(errors.get("viral", ""))[:160],
+    }
+    similar = results.get("similar") or {
+        "channels": [],
+        "error": str(errors.get("similar", ""))[:160],
+    }
+    if viral.get("blocked"):
+        blocked = True
+        warnings.append(f"viral listing blocked: {str(viral.get('error'))[:160]}")
+    if similar.get("blocked"):
+        blocked = True
+        warnings.append(f"similar search blocked: {str(similar.get('error'))[:160]}")
+    if errors.get("transcript") and is_datacenter_block(errors["transcript"]):
+        blocked = True
+        warnings.append(f"transcript blocked: {str(errors['transcript'])[:160]}")
+    if errors.get("comments"):
+        warnings.append(f"comments unavailable: {str(errors['comments'])[:120]}")
+
+    note("Gemini Hook Analysis + Audience Pulse")
     hook = (
         ai_analyzer.analyze_hook_and_pulse(transcript, item.comments)
         if ai_analyzer.available()
         else {"skipped": True, "reason": "no AI key"}
     )
-    note("Finding the top 5 viral videos")
-    try:
-        viral = viral_videos(watch_url, 5)
-    except Exception as exc:
-        viral = {"channel": {}, "videos": [], "error": str(exc)[:160]}
-        if is_datacenter_block(exc):
-            blocked = True
-            warnings.append(f"viral listing blocked: {str(exc)[:160]}")
-    note("Finding similar channels")
-    try:
-        similar = similar_channels(watch_url, 6)
-    except Exception as exc:
-        similar = {"channels": [], "error": str(exc)[:160]}
-        if is_datacenter_block(exc):
-            blocked = True
-            warnings.append(f"similar search blocked: {str(exc)[:160]}")
 
-    markdown_path = OUTPUT_DIR / f"{video_stem}_{video_id}_Intel.md"
+    markdown_path = OUTPUT_DIR / f"{safe_stem(item.title, 'Video')}_{video_id}_Intel.md"
     markdown_path.write_text(
         build_smart_video_markdown(
             item,
@@ -3397,6 +3552,12 @@ def build_smart_video_bundle(
             audio_used,
         ),
         encoding="utf-8",
+    )
+    logger.info(
+        "Smart pipeline for %s finished in %.1fs (blocked=%s)",
+        video_id,
+        time.monotonic() - started,
+        blocked,
     )
     return {
         "item": item,

@@ -28,6 +28,8 @@ services:
         value: vashlimusale-cloud/yt-intel-bot
       - key: GEMINI_MODEL
         value: gemini-3-flash-preview
+      - key: ENABLE_AUDIO_TRANSCRIPTION
+        value: "false"
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID
@@ -35,6 +37,8 @@ services:
       - key: GITHUB_PAT
         sync: false
       - key: GEMINI_API_KEY
+        sync: false
+      - key: YOUTUBE_COOKIES_B64
         sync: false
       - key: OPENROUTER_API_KEY
         sync: false

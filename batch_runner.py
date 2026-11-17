@@ -551,7 +551,11 @@ def _enrich_item(
         except Exception as exc:  # transcripts are best-effort
             logger.warning("Transcript unavailable for %s: %s", video_id, exc)
             ui.trace(f"⚠️ {kind} {index}/{total}: transcript unavailable ({str(exc)[:60]})")
-        if not transcript.strip() and ai_analyzer.available():
+        if (
+            not transcript.strip()
+            and ai_analyzer.audio_transcription_enabled()
+            and ai_analyzer.available()
+        ):
             try:
                 transcript = ai_analyzer.transcribe_video_audio(video_id)
                 if transcript:

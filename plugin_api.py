@@ -244,33 +244,71 @@ def video_payload(url: str) -> dict[str, Any]:
     info = bot.fetch_metadata(watch_url)
     blocked = bool(info.get("_fallback"))
     warnings = list(info.get("_warnings") or [])
-    transcript = bot.fetch_transcript(video_id, bot._caption_tracks(info))
-    audio_used = False
-    if not transcript and ai_analyzer.available():
-        transcript = ai_analyzer.transcribe_video_audio(video_id)
-        audio_used = bool(transcript)
-    comments = bot.fetch_comments(watch_url, limit=MAX_COMMENTS)
-    hook = ai_analyzer.analyze_hook_and_pulse(transcript, comments)
-    channel: dict[str, Any] = {}
-    try:
-        channel = recommender.resolve_channel(watch_url)
-    except Exception as exc:
-        warnings.append(f"channel lookup failed: {str(exc)[:120]}")
-    channel_meta: dict[str, Any] = {
-        "name": channel.get("name"),
-        "handle": channel.get("handle"),
-        "channel_url": channel.get("channel_url"),
-    }
-    if channel.get("channel_url"):
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    def transcript_work() -> tuple[str, bool]:
+        text = bot.fetch_transcript(video_id, bot._caption_tracks(info))
+        used = False
+        if (
+            not text
+            and ai_analyzer.audio_transcription_enabled()
+            and ai_analyzer.available()
+        ):
+            text = ai_analyzer.transcribe_video_audio(video_id)
+            used = bool(text)
+        return text, used
+
+    def channel_work() -> tuple[dict[str, Any], dict[str, Any] | None]:
+        channel_info = recommender.resolve_channel(watch_url)
+        meta = None
+        if channel_info.get("channel_url"):
+            meta = _channel_meta(channel_info["channel_url"])
+        return channel_info, meta
+
+    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="yt-plugin") as pool:
+        transcript_future = pool.submit(transcript_work)
+        comments_future = pool.submit(bot.fetch_comments, watch_url, MAX_COMMENTS)
+        channel_future = pool.submit(channel_work)
         try:
-            channel_meta = _channel_meta(channel["channel_url"])
+            transcript, audio_used = transcript_future.result()
+        except Exception as exc:
+            transcript, audio_used = "", False
+            warnings.append(f"transcript unavailable: {str(exc)[:120]}")
+        try:
+            comments = comments_future.result()
+        except Exception as exc:
+            comments = []
+            warnings.append(f"comments unavailable: {str(exc)[:120]}")
+        channel: dict[str, Any] = {}
+        channel_meta: dict[str, Any] = {}
+        try:
+            channel, meta = channel_future.result()
+            channel_meta = meta or {
+                "name": channel.get("name"),
+                "handle": channel.get("handle"),
+                "channel_url": channel.get("channel_url"),
+            }
+            if meta is None and channel.get("channel_url"):
+                warnings.append("channel deep extraction unavailable")
         except bot.DatacenterBlockError as exc:
             blocked = True
             warnings.append(f"channel deep extraction blocked: {exc}")
             logger.warning("Plugin channel lookup blocked: %s", exc)
-        except Exception as exc:  # metadata is best effort
+            try:
+                channel = recommender.resolve_channel(watch_url)
+            except Exception:
+                channel = {}
+            channel_meta = {
+                "name": channel.get("name"),
+                "handle": channel.get("handle"),
+                "channel_url": channel.get("channel_url"),
+            }
+        except Exception as exc:
             warnings.append(f"channel metadata unavailable: {str(exc)[:120]}")
             logger.warning("Plugin channel lookup failed: %s", exc)
+            channel_meta = {}
+    hook = ai_analyzer.analyze_hook_and_pulse(transcript, comments)
 
     transcript_used = transcript[:MAX_TRANSCRIPT]
     return {

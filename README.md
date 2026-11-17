@@ -182,6 +182,24 @@ Reply messages include an inline `⚙️ Switch Engine` button, plus
   `analyze_youtube_channel`, `find_similar_channels` over stdio for Claude
   Desktop / Claude Code / Cursor. Setup: [PLUGIN_SETUP.md](PLUGIN_SETUP.md).
 
+## Speed, cookies & audio gate
+
+- **Cookie-authenticated yt-dlp**: set `YOUTUBE_COOKIES_B64` (base64 Netscape
+  cookie export) and the bot decodes it to `<tmp>/yt_cookies.txt`, passing
+  `cookiefile` to every yt-dlp call (metadata, channel listing, caption
+  extraction, audio backup). Corrupted control bytes from copy/paste exports are
+  repaired automatically; malformed rows are dropped. Also set it in Render →
+  Environment and as a GitHub secret for Actions.
+- **Parallel single-video pipeline**: metadata + HD thumbnail, transcript,
+  comments, parent channel DP + banner, top-5 viral and similar channels run
+  concurrently via `ThreadPoolExecutor`; Gemini Hook Analysis + Audience Pulse
+  runs once afterwards, then delivery. Typical run: ~25 s instead of minutes.
+- **Audio backup is opt-in**: `ENABLE_AUDIO_TRANSCRIPTION=false` by default, so
+  jobs never wait on audio downloads; captions come from cookie-authenticated
+  YouTube tracks. Set it to `true` for the `worstaudio` + Gemini fallback.
+- **Comment cap**: `MAX_SMART_COMMENTS=300` keeps huge threads fast
+  (env-tunable; batch keeps its own `MAX_COMMENTS_PER_VIDEO`).
+
 ## Smart single-video pipeline
 
 Sending a single YouTube link (or `/video`) returns: video metadata + HD

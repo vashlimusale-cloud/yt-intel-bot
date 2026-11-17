@@ -38,4 +38,6 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           BOT_EXECUTION_MODE: ${{ vars.BOT_EXECUTION_MODE }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          YOUTUBE_COOKIES_B64: ${{ secrets.YOUTUBE_COOKIES_B64 }}
+          ENABLE_AUDIO_TRANSCRIPTION: "false"
         run: python cloud_poller.py
