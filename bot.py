@@ -3366,6 +3366,7 @@ def cloud_single_links_enabled() -> bool:
         os.getenv("RENDER")
         or os.getenv("RENDER_SERVICE_ID")
         or os.getenv("RENDER_EXTERNAL_URL")
+        or (os.getenv("RUN_ENV") or "").strip().lower() == "render"
     )
 
 

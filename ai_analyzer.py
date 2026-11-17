@@ -28,11 +28,13 @@ import yt_dlp
 
 logger = logging.getLogger("yt-bot.ai")
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL") or "gemini-2.5-flash"
-GEMINI_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
-    f"{GEMINI_MODEL}:generateContent"
+DEFAULT_GEMINI_MODEL = "gemini-3-flash-preview"
+GEMINI_FALLBACK_MODELS = (
+    "gemini-flash-latest",
+    "gemini-3.5-flash",
+    "gemini-2.5-flash",
 )
+GEMINI_MODEL = (os.getenv("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL).strip()
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL") or "openai/gpt-4o-mini"
 
@@ -121,6 +123,17 @@ def _post_with_backoff(url: str, *, headers: dict[str, str], payload: dict[str, 
     raise RuntimeError(last_error or "AI provider unavailable")
 
 
+def _gemini_models() -> list[str]:
+    """Configured model first, then known-good fallbacks (some are retired/503)."""
+    configured = (os.getenv("GEMINI_MODEL") or GEMINI_MODEL or DEFAULT_GEMINI_MODEL).strip()
+    models = [configured, *GEMINI_FALLBACK_MODELS]
+    seen: list[str] = []
+    for model in models:
+        if model and model not in seen:
+            seen.append(model)
+    return seen
+
+
 def _gemini_request(
     parts: list[dict[str, Any]], *, json_output: bool = False, temperature: float = 0.2
 ) -> str:
@@ -133,16 +146,32 @@ def _gemini_request(
     }
     if json_output:
         payload["generationConfig"]["responseMimeType"] = "application/json"
-    data = _post_with_backoff(
-        f"{GEMINI_URL}?key={key}",
-        headers={"Content-Type": "application/json"},
-        payload=payload,
-    )
-    candidates = data.get("candidates") or []
-    if not candidates:
-        raise RuntimeError("Gemini returned no candidates")
-    content_parts = (candidates[0].get("content") or {}).get("parts") or []
-    return "".join(str(part.get("text") or "") for part in content_parts)
+    last_error = ""
+    for model in _gemini_models():
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model}:generateContent"
+        )
+        try:
+            data = _post_with_backoff(
+                url,
+                headers={
+                    "Content-Type": "application/json",
+                    "x-goog-api-key": key,
+                },
+                payload=payload,
+            )
+        except Exception as exc:
+            last_error = f"{model}: {str(exc)[:120]}"
+            logger.warning("Gemini model %s unavailable: %s", model, str(exc)[:120])
+            continue
+        candidates = data.get("candidates") or []
+        if not candidates:
+            last_error = f"{model}: no candidates"
+            continue
+        content_parts = (candidates[0].get("content") or {}).get("parts") or []
+        return "".join(str(part.get("text") or "") for part in content_parts)
+    raise RuntimeError(f"Gemini models unavailable ({last_error})")
 
 
 def _openrouter_request(prompt: str, *, json_output: bool = False) -> str:
