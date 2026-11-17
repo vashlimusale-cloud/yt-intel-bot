@@ -1,0 +1,30 @@
+# Render.com blueprint — free Python web service for the Telegram bot.
+# Deploy: push this repo, then in Render choose "New > Blueprint" and point it at
+# the repo. Fill the secret env vars in the dashboard (they are marked sync:false):
+#   TELEGRAM_BOT_TOKEN, GITHUB_PAT, GITHUB_REPO, TELEGRAM_CHAT_ID
+# Keep the service awake 24/7 by pinging https://<service>.onrender.com/health
+# with UptimeRobot (free plan sleeps after ~15 min of inactivity).
+services:
+  - type: web
+    name: yt-intel-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: CLOUD_SINGLE_LINKS
+        value: "true"
+      - key: GITHUB_BRANCH
+        value: main
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: GITHUB_PAT
+        sync: false
+      - key: GITHUB_REPO
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false

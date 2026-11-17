@@ -22,6 +22,7 @@ between channels, so ~150-250 videos finish without YouTube rate limits.
 
 from __future__ import annotations
 
+import io
 import logging
 import math
 import os
@@ -179,6 +180,37 @@ class TelegramClient:
                 time.sleep(2)
         return False
 
+    def send_photo(self, path: Path, caption: str = "") -> bool:
+        """Send one avatar/thumbnail photo (120s timeout, 1 retry)."""
+        for attempt in range(1, 3):
+            try:
+                with path.open("rb") as handle:
+                    response = requests.post(
+                        f"{self.base_url}/sendPhoto",
+                        data={
+                            "chat_id": self.chat_id,
+                            "caption": caption[:1024],
+                            "parse_mode": "HTML",
+                        },
+                        files={"photo": (path.name, handle)},
+                        timeout=TELEGRAM_UPLOAD_TIMEOUT,
+                    )
+                if response.ok and response.json().get("ok"):
+                    return True
+                logger.warning(
+                    "sendPhoto %s rejected (%s): %s",
+                    path.name,
+                    response.status_code,
+                    response.text[:200],
+                )
+            except requests.Timeout:
+                logger.warning("sendPhoto %s timed out (attempt %d/2)", path.name, attempt)
+            except requests.RequestException as exc:
+                logger.warning("sendPhoto %s failed: %s", path.name, exc)
+            if attempt == 1:
+                time.sleep(2)
+        return False
+
 
 # --------------------------------------------------------------------------- #
 # Live progress UI
@@ -299,6 +331,93 @@ def category_folder(category: str) -> Path:
     return BATCH_DIR / safe
 
 
+# --------------------------------------------------------------------------- #
+# Image downloads (channel avatar + video/Short thumbnails, as real .jpg files)
+# --------------------------------------------------------------------------- #
+def _save_jpeg(content: bytes, dest: Path, minimum: int = 2000) -> Path | None:
+    """Write JPEG bytes (convert other formats); reject tiny 404 placeholders."""
+    if len(content) < minimum:
+        return None
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if content[:3] == b"\xff\xd8\xff":
+        dest.write_bytes(content)
+        return dest
+    try:
+        from PIL import Image  # local import: Pillow is optional at runtime
+
+        with Image.open(io.BytesIO(content)) as image:
+            image.convert("RGB").save(dest, "JPEG", quality=92)
+        return dest
+    except Exception:
+        try:
+            dest.write_bytes(content)
+            return dest
+        except OSError as exc:
+            logger.warning("Could not save image %s: %s", dest, exc)
+            return None
+
+
+def download_image(url: str, dest: Path, minimum: int = 2000) -> Path | None:
+    if not url:
+        return None
+    try:
+        response = requests.get(
+            url,
+            headers={
+                "User-Agent": yt_bot.USER_AGENT,
+                "Accept": "image/jpeg,image/png,image/*",
+            },
+            timeout=yt_bot.HTTP_TIMEOUT,
+        )
+    except requests.RequestException as exc:
+        logger.warning("Image download failed (%s): %s", str(url)[:90], exc)
+        return None
+    if not response.ok:
+        return None
+    return _save_jpeg(response.content, dest, minimum=minimum)
+
+
+def download_channel_avatar(profile: Any, dest: Path) -> Path | None:
+    """Download the channel profile picture as a real .jpg (highest resolution)."""
+    url = str(getattr(profile, "avatar_url", "") or "").strip()
+    if not url:
+        return None
+    candidates: list[str] = []
+    upgraded = yt_bot._upgrade_avatar_url(url)
+    if upgraded:
+        candidates.append(upgraded)
+    if url not in candidates:
+        candidates.append(url)
+    for candidate in candidates:
+        path = download_image(candidate, dest)
+        if path:
+            return path
+    return None
+
+
+def thumbnail_filename(index: int, title: str, video_id: str) -> str:
+    stem = yt_bot.safe_stem(title, "Video")[:60]
+    return f"{index:03d}_{stem}_{video_id}.jpg"
+
+
+def download_video_thumbnail(
+    video_id: str, info_thumbnail: Any, dest: Path
+) -> Path | None:
+    """Download the best video/Short thumbnail, rejecting <2KB 404 placeholders."""
+    candidates = [
+        f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
+        f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+    ]
+    fallback = str(info_thumbnail or "").strip()
+    if fallback and fallback not in candidates:
+        candidates.append(fallback)
+    for candidate in candidates:
+        path = download_image(candidate, dest)
+        if path:
+            return path
+    return None
+
+
 def retry_call(label: str, work: Callable[[], Any], ui: LiveBatchUI) -> tuple[Any | None, str]:
     """Run `work` with one retry; returns (result, error)."""
     last_error = ""
@@ -341,6 +460,7 @@ class FullChannel:
     category: categorizer.CategoryResult
     xlsx_path: Path
     md_path: Path
+    avatar_path: Path | None = None
     elapsed: float = 0.0
 
     @property
@@ -366,6 +486,7 @@ class StandaloneVideo:
     transcript: str
     comments: list[dict[str, Any]]
     md_path: Path
+    thumbnail_file: str = ""
     elapsed: float = 0.0
 
 
@@ -406,15 +527,24 @@ class BatchSummary:
 # --------------------------------------------------------------------------- #
 # Channel intel: metadata + transcript + top comments
 # --------------------------------------------------------------------------- #
-def _enrich_item(item: Any, ui: LiveBatchUI, index: int, total: int, kind: str) -> None:
-    """Attach the full transcript and top comments to one channel item."""
+def _enrich_item(
+    item: Any,
+    ui: LiveBatchUI,
+    index: int,
+    total: int,
+    kind: str,
+    thumbnails_dir: Path | None = None,
+) -> None:
+    """Attach transcript, top comments and a real thumbnail .jpg to one item."""
     video_id = yt_bot.extract_video_id(item.url)
     transcript = ""
     comments: list[dict[str, Any]] = []
     if video_id:
         watch_url = f"https://www.youtube.com/watch?v={video_id}"
         try:
-            transcript = yt_bot.fetch_transcript(video_id)
+            transcript = yt_bot.fetch_transcript(
+                video_id, getattr(item, "captions", None)
+            )
         except Exception as exc:  # transcripts are best-effort
             logger.warning("Transcript unavailable for %s: %s", video_id, exc)
             ui.trace(f"⚠️ {kind} {index}/{total}: transcript unavailable ({str(exc)[:60]})")
@@ -427,10 +557,18 @@ def _enrich_item(item: Any, ui: LiveBatchUI, index: int, total: int, kind: str) 
                 ui.trace(f"⚠️ {kind} {index}/{total}: comments unavailable ({str(exc)[:60]})")
         item.transcript = transcript
         item.comments = comments
+        if thumbnails_dir is not None:
+            thumb_path = download_video_thumbnail(
+                video_id,
+                getattr(item, "thumbnail_url", ""),
+                thumbnails_dir / thumbnail_filename(index, item.title, video_id),
+            )
+            if thumb_path:
+                item.thumbnail_file = thumb_path.name
     label = item.title if len(item.title) <= 42 else item.title[:41] + "…"
     ui.trace(
         f"🎬 {kind} {index}/{total}: {label} · transcript {len(transcript):,} chars · "
-        f"{len(comments)} comments"
+        f"{len(comments)} comments · thumb {'✓' if getattr(item, 'thumbnail_file', '') else '✗'}"
     )
     ui.update()
 
@@ -471,18 +609,36 @@ def audit_channel_full(url: str, ui: LiveBatchUI) -> FullChannel:
     videos = yt_bot.fetch_items_with_details(
         video_entries, "Video", own_handles=own_handles, progress=ui.trace
     )
-    ui.trace(f"🗣 Now transcripts + top {MAX_COMMENTS_PER_VIDEO} comments for {len(videos)} videos")
-    ui.update()
-    for index, item in enumerate(videos, start=1):
-        _enrich_item(item, ui, index, len(videos), "video")
-        if index < len(videos):
-            time.sleep(random.uniform(VIDEO_DELAY_MIN, VIDEO_DELAY_MAX))
-
     shorts = yt_bot.fetch_items_with_details(
         short_entries, "Short", own_handles=own_handles, progress=ui.trace
     )
+
+    category = categorizer.categorize_channel(
+        categorizer.build_snapshot(profile, videos, shorts, [])
+    )
+    channel_stem = yt_bot.safe_stem(profile.name, "YouTube_Channel")
+    folder = category_folder(category.category) / channel_stem
+    thumbnails_dir = folder / "thumbnails"
+    thumbnails_dir.mkdir(parents=True, exist_ok=True)
+    avatar_name = f"{channel_stem}_avatar.jpg"
+    avatar_path = download_channel_avatar(profile, folder / avatar_name)
+    if avatar_path:
+        ui.trace(f"🖼 Avatar saved: {category.category}/{channel_stem}/{avatar_name}")
+    else:
+        ui.trace(f"⚠️ No avatar could be downloaded for {profile.name}")
+    ui.update()
+
+    ui.trace(
+        f"🗣 Transcripts + top {MAX_COMMENTS_PER_VIDEO} comments + real thumbnails "
+        f"for {len(videos)} videos and {len(shorts)} Shorts"
+    )
+    ui.update()
+    for index, item in enumerate(videos, start=1):
+        _enrich_item(item, ui, index, len(videos), "video", thumbnails_dir)
+        if index < len(videos):
+            time.sleep(random.uniform(VIDEO_DELAY_MIN, VIDEO_DELAY_MAX))
     for index, item in enumerate(shorts, start=1):
-        _enrich_item(item, ui, index, len(shorts), "short")
+        _enrich_item(item, ui, index, len(shorts), "short", thumbnails_dir)
         if index < len(shorts):
             time.sleep(random.uniform(VIDEO_DELAY_MIN, VIDEO_DELAY_MAX))
 
@@ -490,11 +646,8 @@ def audit_channel_full(url: str, ui: LiveBatchUI) -> FullChannel:
     ui.update()
     posts = yt_bot.fetch_community_posts(resolved_url, own_handles)
     yt_bot.resolve_collaborator_ids(videos + shorts, posts, own_channel_id=profile.channel_id)
-
-    category = categorizer.categorize_channel(
-        categorizer.build_snapshot(profile, videos, shorts, posts)
-    )
     collaborators = yt_bot.collect_collaborators(videos + shorts, posts)
+
     ui.trace(
         f"🧠 Niche: {category.category} / {category.sub_niche} "
         f"(score {category.score}, {category.source}, confidence {category.confidence})"
@@ -505,17 +658,33 @@ def audit_channel_full(url: str, ui: LiveBatchUI) -> FullChannel:
         ui.trace(f"🤝 Collaborators detected: {', '.join(collaborators[:8])}")
     ui.update()
 
-    folder = category_folder(category.category)
-    folder.mkdir(parents=True, exist_ok=True)
-    stem = f"{yt_bot.safe_stem(profile.name, 'YouTube_Channel')}_Full_Intel"
-    xlsx_path = folder / f"{stem}.xlsx"
-    md_path = folder / f"{stem}.md"
-    write_full_channel_workbook(profile, videos, shorts, posts, category, xlsx_path)
+    xlsx_path = folder / f"{channel_stem}_Full_Intel.xlsx"
+    md_path = folder / f"{channel_stem}_Full_Intel.md"
+    write_full_channel_workbook(
+        profile,
+        videos,
+        shorts,
+        posts,
+        category,
+        xlsx_path,
+        avatar_file=avatar_name if avatar_path else "",
+    )
     md_path.write_text(
-        build_full_channel_markdown(profile, videos, shorts, posts, category),
+        build_full_channel_markdown(
+            profile,
+            videos,
+            shorts,
+            posts,
+            category,
+            avatar_file=avatar_name if avatar_path else "",
+        ),
         encoding="utf-8",
     )
-    ui.trace(f"📁 Saved {xlsx_path.name} + {md_path.name} in {category.category}/")
+    downloaded = sum(1 for item in videos + shorts if getattr(item, "thumbnail_file", ""))
+    ui.trace(
+        f"📁 Saved {xlsx_path.name} + {md_path.name} + {downloaded} thumbnail(s) in "
+        f"{category.category}/{channel_stem}/"
+    )
     ui.update()
     return FullChannel(
         url=url,
@@ -527,6 +696,7 @@ def audit_channel_full(url: str, ui: LiveBatchUI) -> FullChannel:
         category=category,
         xlsx_path=xlsx_path,
         md_path=md_path,
+        avatar_path=avatar_path,
         elapsed=time.monotonic() - started,
     )
 
@@ -542,17 +712,32 @@ def process_standalone_video(url: str, ui: LiveBatchUI, index: int, total: int) 
     watch_url = f"https://www.youtube.com/watch?v={video_id}"
     info = yt_bot.fetch_metadata(watch_url)
     item = yt_bot.build_channel_item(
-        info, "Video", own_handles=(), collaboration_source=info, video_id=video_id
+        info,
+        "Video",
+        own_handles=(),
+        collaboration_source=info,
+        video_id=video_id,
+        captions=yt_bot._caption_tracks(info),
     )
-    thumbnail_url = str(
-        info.get("thumbnail") or f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg"
+    thumbnail_url = str(info.get("thumbnail") or yt_bot.thumbnail_url_for(video_id))
+
+    STANDALONE_DIR.mkdir(parents=True, exist_ok=True)
+    thumbnails_dir = STANDALONE_DIR / "thumbnails"
+    thumbnails_dir.mkdir(parents=True, exist_ok=True)
+    thumb_path = download_video_thumbnail(
+        video_id,
+        info.get("thumbnail"),
+        thumbnails_dir / thumbnail_filename(index, item.title, video_id),
     )
-    ui.trace(f"🎬 Standalone {index}/{total}: {item.title[:48]} — fetching transcript")
+    ui.trace(
+        f"🎬 Standalone {index}/{total}: {item.title[:48]} — thumbnail "
+        f"{'✓' if thumb_path else '✗'}, fetching transcript"
+    )
     ui.update()
 
     transcript = ""
     try:
-        transcript = yt_bot.fetch_transcript(video_id)
+        transcript = yt_bot.fetch_transcript(video_id, yt_bot._caption_tracks(info))
     except Exception as exc:
         logger.warning("Transcript unavailable for %s: %s", video_id, exc)
         ui.trace(f"⚠️ Transcript unavailable for {video_id}: {str(exc)[:80]}")
@@ -571,7 +756,6 @@ def process_standalone_video(url: str, ui: LiveBatchUI, index: int, total: int) 
         logger.warning("Comments unavailable for %s: %s", video_id, exc)
         ui.trace(f"⚠️ Comments unavailable for {video_id}: {str(exc)[:80]}")
 
-    STANDALONE_DIR.mkdir(parents=True, exist_ok=True)
     md_path = STANDALONE_DIR / (
         f"{yt_bot.safe_stem(item.title, 'Video')}_{video_id}_Full_Intel.md"
     )
@@ -592,10 +776,14 @@ def process_standalone_video(url: str, ui: LiveBatchUI, index: int, total: int) 
         transcript=transcript,
         comments=comments,
         md_path=md_path,
+        thumbnail_file=thumb_path.name if thumb_path else "",
         elapsed=time.monotonic() - started,
     )
     md_path.write_text(build_standalone_markdown(video), encoding="utf-8")
-    ui.trace(f"💾 Standalone dossier saved: {md_path.name} · {len(comments)} comments")
+    ui.trace(
+        f"💾 Standalone dossier saved: {md_path.name} · {len(comments)} comments · "
+        f"thumb {'✓' if thumb_path else '✗'}"
+    )
     ui.update()
     time.sleep(random.uniform(VIDEO_DELAY_MIN, VIDEO_DELAY_MAX))
     return video
@@ -663,6 +851,8 @@ def write_full_channel_workbook(
     posts: list[Any],
     category: categorizer.CategoryResult,
     dest: Path,
+    *,
+    avatar_file: str = "",
 ) -> Path:
     """`<Channel>_Full_Intel.xlsx` with overview, videos, shorts, posts tabs."""
     if not yt_bot.OPENPYXL_AVAILABLE:
@@ -673,9 +863,11 @@ def write_full_channel_workbook(
         ["Channel", "Detected Category", category.category],
         ["Channel", "Detected Sub-Niche", category.sub_niche],
         ["Channel", "Category Confidence", category.confidence],
+        ["Channel", "Channel Avatar File", avatar_file or profile.avatar_url or "N/A"],
     ] + yt_bot._overview_rows(profile, videos + shorts, posts, collaborators)
     overview_rows.append(["SEO Summary", "Transcripts Collected", sum(1 for i in videos + shorts if i.transcript)])
     overview_rows.append(["SEO Summary", "Comments Collected", sum(len(i.comments) for i in videos + shorts)])
+    overview_rows.append(["SEO Summary", "Thumbnails Downloaded", sum(1 for i in videos + shorts if getattr(i, "thumbnail_file", ""))])
 
     workbook = yt_bot.Workbook()
     overview = workbook.active
@@ -692,41 +884,45 @@ def write_full_channel_workbook(
     video_sheet = workbook.create_sheet("Videos")
     video_headers = [
         "Title", "Video_URL", "Upload_Date", "Views", "Likes", "Comment_Count",
-        "Duration_Sec", "Category", "Tags", "Collaborations_Detected", "Description",
-        "Full_Transcript", "Top_Comments",
+        "Duration_Sec", "Category", "Tags", "Collaborations_Detected",
+        "Thumbnail_URL", "Thumbnail_File", "Description", "Full_Transcript", "Top_Comments",
     ]
     video_rows = [
         [
             item.title, item.url, item.upload_date, item.views, item.likes,
             item.comment_count, item.duration_sec, item.category, ", ".join(item.tags),
-            item.collaborations, _cell(item.description),
+            item.collaborations, getattr(item, "thumbnail_url", ""),
+            getattr(item, "thumbnail_file", ""), _cell(item.description),
             _cell(item.transcript), format_comments_cell(item.comments),
         ]
         for item in videos
     ]
     yt_bot._write_table(
         video_sheet, video_headers, video_rows,
-        wrap_columns=(1, 9, 11, 12, 13), caps={1: 60, 2: 50, 9: 40, 10: 34, 11: 60, 12: 70, 13: 70},
+        wrap_columns=(1, 9, 13, 14, 15),
+        caps={1: 60, 2: 50, 9: 40, 10: 34, 13: 60, 14: 70, 15: 70},
     )
 
     short_sheet = workbook.create_sheet("Shorts")
     short_headers = [
         "Title", "Shorts_URL", "Upload_Date", "Views", "Likes", "Comment_Count",
-        "Duration_Sec", "Tags", "Collaborations_Detected", "Description",
-        "Full_Transcript", "Top_Comments",
+        "Duration_Sec", "Tags", "Collaborations_Detected",
+        "Thumbnail_URL", "Thumbnail_File", "Description", "Full_Transcript", "Top_Comments",
     ]
     short_rows = [
         [
             item.title, item.url, item.upload_date, item.views, item.likes,
             item.comment_count, item.duration_sec, ", ".join(item.tags),
-            item.collaborations, _cell(item.description),
+            item.collaborations, getattr(item, "thumbnail_url", ""),
+            getattr(item, "thumbnail_file", ""), _cell(item.description),
             _cell(item.transcript), format_comments_cell(item.comments),
         ]
         for item in shorts
     ]
     yt_bot._write_table(
         short_sheet, short_headers, short_rows,
-        wrap_columns=(1, 8, 10, 11, 12), caps={1: 60, 2: 50, 8: 40, 9: 34, 10: 60, 11: 70, 12: 70},
+        wrap_columns=(1, 8, 12, 13, 14),
+        caps={1: 60, 2: 50, 8: 40, 9: 34, 12: 60, 13: 70, 14: 70},
     )
 
     post_sheet = workbook.create_sheet("Community_Posts")
@@ -759,11 +955,14 @@ def build_full_channel_markdown(
     shorts: list[Any],
     posts: list[Any],
     category: categorizer.CategoryResult,
+    *,
+    avatar_file: str = "",
 ) -> str:
     collaborators = yt_bot.collect_collaborators(videos + shorts, posts)
     lines: list[str] = [f"# {profile.name}", ""]
-    if profile.avatar_url:
-        lines += [f"![Channel Avatar]({profile.avatar_url})", ""]
+    avatar_link = f"./{avatar_file}" if avatar_file else profile.avatar_url
+    if avatar_link:
+        lines += [f"![Channel Avatar]({avatar_link})", ""]
     lines += [
         f"**Niche:** {category.category} / {category.sub_niche} "
         f"(score {category.score}, {category.source}, confidence {category.confidence})",
@@ -811,7 +1010,11 @@ def build_full_channel_markdown(
             f"- **Collaborations:** {item.collaborations or 'None detected'}",
             "",
         ]
-        thumbnail = _thumbnail_for(item.url)
+        thumbnail = (
+            f"./thumbnails/{item.thumbnail_file}"
+            if getattr(item, "thumbnail_file", "")
+            else _thumbnail_for(item.url)
+        )
         if thumbnail:
             lines += [f"![Thumbnail]({thumbnail})", ""]
         lines += ["**Transcript**", "", item.transcript or "_Transcript unavailable._", ""]
@@ -858,10 +1061,13 @@ def build_full_channel_markdown(
 
 
 def build_standalone_markdown(video: StandaloneVideo) -> str:
+    thumbnail_link = (
+        f"./thumbnails/{video.thumbnail_file}" if video.thumbnail_file else video.thumbnail_url
+    )
     lines = [
         f"# {video.title}",
         "",
-        f"![Thumbnail]({video.thumbnail_url})",
+        f"![Thumbnail]({thumbnail_link})",
         "",
         "## 📊 Video Details",
         "",
@@ -909,8 +1115,16 @@ OVERVIEW_HEADERS = [
     "Subscribers", "Total_Views", "Videos_Fetched", "Shorts_Fetched", "Posts_Fetched",
     "Transcripts", "Comments_Collected", "Collaborations_Count", "Collaborators",
     "Avg_Views_Video", "Avg_Views_Short", "Joined_Date", "Country", "Public_Email",
-    "Channel_URL", "Excel_File", "Markdown_File",
+    "Channel_URL", "Avatar_File", "Excel_File", "Markdown_File",
 ]
+
+
+def _relative_path(path: Path) -> str:
+    """Path relative to output/batch_result (used inside the master workbook)."""
+    try:
+        return path.relative_to(BATCH_DIR).as_posix()
+    except ValueError:
+        return path.name
 
 
 def _average_views(items: list[Any]) -> int | None:
@@ -942,8 +1156,9 @@ def overview_row(channel: FullChannel) -> list[Any]:
         profile.country,
         profile.email,
         profile.url,
-        channel.xlsx_path.name,
-        channel.md_path.name,
+        channel.avatar_path.name if channel.avatar_path else "",
+        _relative_path(channel.xlsx_path),
+        _relative_path(channel.md_path),
     ]
 
 
@@ -959,7 +1174,7 @@ def build_master_workbook(
     rows = [overview_row(channel) for channel in channels]
     yt_bot._write_table(
         overview, OVERVIEW_HEADERS, rows,
-        wrap_columns=(1, 15, 22), caps={1: 34, 2: 24, 15: 46, 21: 40},
+        wrap_columns=(1, 15, 23), caps={1: 34, 2: 24, 15: 46, 23: 60},
     )
 
     for category in sorted({channel.category.category for channel in channels}):
@@ -967,7 +1182,7 @@ def build_master_workbook(
         subset = [overview_row(c) for c in channels if c.category.category == category]
         yt_bot._write_table(
             sheet, OVERVIEW_HEADERS, subset,
-            wrap_columns=(1, 15, 22), caps={1: 34, 2: 24, 15: 46, 21: 40},
+            wrap_columns=(1, 15, 23), caps={1: 34, 2: 24, 15: 46, 23: 60},
         )
 
     if standalone:
@@ -975,22 +1190,23 @@ def build_master_workbook(
         headers = [
             "Video_ID", "Title", "Video_URL", "Upload_Date", "Views", "Likes",
             "Comment_Count", "Comments_Fetched", "Duration_Sec", "Category", "Tags",
-            "Collaborations_Detected", "Thumbnail_URL", "Full_Transcript", "All_Comments",
-            "Markdown_File",
+            "Collaborations_Detected", "Thumbnail_URL", "Thumbnail_File",
+            "Full_Transcript", "All_Comments", "Markdown_File",
         ]
         rows = [
             [
                 video.video_id, video.title, video.url, video.upload_date, video.views,
                 video.likes, video.comment_count, len(video.comments), video.duration_sec,
                 video.category, ", ".join(video.tags), video.collaborations,
-                video.thumbnail_url, _cell(video.transcript),
-                format_comments_cell(video.comments), video.md_path.name,
+                video.thumbnail_url, video.thumbnail_file,
+                _cell(video.transcript), format_comments_cell(video.comments),
+                _relative_path(video.md_path),
             ]
             for video in standalone
         ]
         yt_bot._write_table(
             sheet, headers, rows,
-            wrap_columns=(2, 15, 16), caps={2: 50, 3: 50, 12: 34, 15: 70, 16: 70},
+            wrap_columns=(2, 16, 17), caps={2: 50, 3: 50, 12: 34, 16: 70, 17: 70},
         )
 
     top_sheet = workbook.create_sheet("Top_Videos_Combined")
@@ -1079,6 +1295,17 @@ def run_batch(
             f"{len(result.posts)} posts · {len(result.collaborators)} collaborators · "
             f"{result.category.category} · {result.elapsed:.0f}s"
         )
+        if result.avatar_path is not None:
+            avatar_caption = (
+                f"<b>{result.profile.name}</b>\n"
+                f"🧠 {result.category.category} / {result.category.sub_niche}\n"
+                f"🎬 {len(result.videos)} videos · 📱 {len(result.shorts)} shorts · "
+                f"💬 {len(result.posts)} posts"
+            )
+            if ui.client.send_photo(result.avatar_path, avatar_caption):
+                ui.trace("🖼 Channel avatar sent to Telegram")
+            else:
+                ui.trace("⚠️ Channel avatar photo upload failed (file still in ZIP)")
         ui.tick(index, 0)
         ui.update()
         if index < len(channels):

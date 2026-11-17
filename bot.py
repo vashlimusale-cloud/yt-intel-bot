@@ -22,9 +22,11 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
@@ -58,6 +60,7 @@ ENV_PATH = BASE_DIR / ".env"
 TOKEN_PLACEHOLDER = "PASTE_YOUR_BOTFATHER_TOKEN_HERE"
 TOKEN_RE = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{20,}$")
 PREFERRED_LANGUAGES = ["hi", "en", "en-IN"]
+TRANSCRIPT_LANGUAGE_PRIORITY = ["hi", "en", "en-IN", "en-US", "en-GB"]
 MAX_COMMENTS = 0  # 0 = every comment; set e.g. 500 to cap very large threads
 MAX_CAPTION = 1024  # Telegram's hard limit for photo/document captions
 HTTP_TIMEOUT = 30
@@ -225,8 +228,18 @@ def download_thumbnail(
     return None, str(info.get("thumbnail") or candidates[0])
 
 
-def fetch_transcript(video_id: str) -> str:
-    """Return the full timestamped transcript, preferring hi / en / en-IN."""
+def _caption_tracks(info: dict[str, Any] | None) -> dict[str, Any]:
+    """Extract subtitle/auto-caption track maps from yt-dlp info."""
+    if not isinstance(info, dict):
+        return {}
+    return {
+        "subtitles": info.get("subtitles") or {},
+        "automatic_captions": info.get("automatic_captions") or {},
+    }
+
+
+def _transcript_from_api(video_id: str) -> str:
+    """Primary extractor: youtube-transcript-api (v1.2 instance API or legacy)."""
     api = YouTubeTranscriptApi()
     if hasattr(api, "list"):  # youtube-transcript-api >= 1.2 (instance API)
         transcript_list = api.list(video_id)
@@ -243,6 +256,7 @@ def fetch_transcript(video_id: str) -> str:
     fetched = transcript.fetch()
     snippets = getattr(fetched, "snippets", fetched)  # v1.2+ object vs legacy list
     lines: list[str] = []
+    previous = ""
     for snippet in snippets:
         if isinstance(snippet, dict):
             text, start = snippet.get("text", ""), snippet.get("start", 0)
@@ -250,9 +264,283 @@ def fetch_transcript(video_id: str) -> str:
             text, start = snippet.text, snippet.start
         # Captions often wrap mid-sentence; keep one transcript line per snippet.
         text = re.sub(r"\s+", " ", text or "").strip()
-        if text:
+        if text and text != previous:
+            previous = text
             lines.append(f"[{_fmt_timestamp(start)}] {text}")
     return "\n".join(lines)
+
+
+def _best_caption_entry(entries: Any) -> dict[str, Any] | None:
+    """Pick a json3 (preferred) or vtt caption track entry."""
+    if not isinstance(entries, list):
+        return None
+    for wanted_ext in ("json3", "vtt"):
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("ext") or "").lower() == wanted_ext and entry.get("url"):
+                return entry
+    return None
+
+
+def _ordered_caption_entries(captions: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """All usable caption tracks ordered by language priority (original first)."""
+    if not captions:
+        return []
+    manual = captions.get("subtitles") or {}
+    automatic = captions.get("automatic_captions") or {}
+    ordered: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def push(entries: Any) -> None:
+        entry = _best_caption_entry(entries)
+        if entry and entry.get("url") not in seen:
+            seen.add(entry["url"])
+            ordered.append(entry)
+
+    for language in TRANSCRIPT_LANGUAGE_PRIORITY:
+        for tracks in (manual, automatic):
+            entries = tracks.get(language) or []
+            originals = [
+                item
+                for item in entries
+                if isinstance(item, dict) and "tlang=" not in str(item.get("url") or "")
+            ]
+            push(originals)
+            push(entries)
+    for tracks in (manual, automatic):
+        for language in sorted(tracks):
+            if str(language).lower().startswith(("hi", "en")):
+                push(tracks.get(language))
+    for tracks in (manual, automatic):
+        for language in sorted(tracks):
+            push(tracks.get(language))
+    return ordered
+
+
+def _pick_caption_entry(captions: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Choose a caption track: hi/en/en-IN/en-US/en-GB, then any hi/en, then any."""
+    entries = _ordered_caption_entries(captions)
+    return entries[0] if entries else None
+
+
+def _extract_info_with_clients(video_id: str) -> dict[str, Any]:
+    """Targeted yt-dlp extraction using data-centre friendly player clients."""
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "socket_timeout": HTTP_TIMEOUT,
+        "extractor_args": {
+            "youtube": {"player_client": ["android", "ios", "tv_embedded", "web"]}
+        },
+    }
+    with yt_dlp.YoutubeDL(options) as ydl:
+        info = ydl.extract_info(
+            f"https://www.youtube.com/watch?v={video_id}", download=False
+        )
+    return info if isinstance(info, dict) else {}
+
+
+def _parse_json3_captions(payload: dict[str, Any]) -> list[tuple[float, str]]:
+    cues: list[tuple[float, str]] = []
+    for event in payload.get("events") or []:
+        if not isinstance(event, dict):
+            continue
+        segments = event.get("segs") or []
+        text = "".join(
+            str(segment.get("utf8") or "")
+            for segment in segments
+            if isinstance(segment, dict)
+        )
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text:
+            continue
+        start = float(event.get("tStartMs") or 0) / 1000.0
+        cues.append((start, text))
+    return cues
+
+
+def _parse_vtt_time(value: str) -> float:
+    parts = value.replace(",", ".").split(":")
+    try:
+        if len(parts) == 3:
+            hours, minutes, seconds = parts
+        elif len(parts) == 2:
+            hours, minutes, seconds = "0", parts[0], parts[1]
+        else:
+            return 0.0
+        return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _parse_vtt_captions(body: str) -> list[tuple[float, str]]:
+    cues: list[tuple[float, str]] = []
+    lines = body.splitlines()
+    index = 0
+    while index < len(lines):
+        line = lines[index].strip()
+        if "-->" not in line:
+            index += 1
+            continue
+        start = _parse_vtt_time(line.split("-->")[0].strip())
+        index += 1
+        parts: list[str] = []
+        while index < len(lines) and lines[index].strip():
+            text = re.sub(r"<[^>]+>", "", lines[index]).strip()
+            if text:
+                parts.append(text)
+            index += 1
+        text = re.sub(r"\s+", " ", " ".join(parts)).strip()
+        if text:
+            cues.append((start, text))
+    return cues
+
+
+def _format_transcript_cues(cues: list[tuple[float, str]]) -> str:
+    lines: list[str] = []
+    previous = ""
+    for start, text in cues:
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text or text == previous:
+            continue
+        previous = text
+        lines.append(f"[{_fmt_timestamp(start)}] {text}")
+    return "\n".join(lines)
+
+
+def _download_caption_track(url: str, attempts: int = 3) -> str:
+    """Download a YouTube timedtext track, retrying on 403/429 throttling."""
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Referer": "https://www.youtube.com/",
+        "Origin": "https://www.youtube.com",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.get(url, timeout=HTTP_TIMEOUT, headers=headers)
+            if response.ok and response.text.strip():
+                return response.text
+            if response.status_code in (403, 429):
+                logger.info(
+                    "Caption track throttled (%s), attempt %d/%d",
+                    response.status_code,
+                    attempt,
+                    attempts,
+                )
+        except requests.RequestException as exc:
+            logger.warning("Caption track request failed: %s", exc)
+        if attempt < attempts:
+            time.sleep(1.5 * attempt)
+    return ""
+
+
+def _parse_caption_body(body: str, ext: str = "") -> str:
+    if not body.strip():
+        return ""
+    if ext.lower() == "json3" or body.lstrip().startswith("{"):
+        try:
+            payload = json.loads(body)
+        except ValueError:
+            return ""
+        return _format_transcript_cues(_parse_json3_captions(payload))
+    return _format_transcript_cues(_parse_vtt_captions(body))
+
+
+def _subtitles_via_ytdlp(video_id: str) -> str:
+    """Last resort: let yt-dlp download the caption files itself, then parse them."""
+    with tempfile.TemporaryDirectory(prefix="yt_subs_") as temp_dir:
+        options = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "writesubtitles": True,
+            "writeautomaticsub": True,
+            "subtitleslangs": [*TRANSCRIPT_LANGUAGE_PRIORITY, "en-orig"],
+            "subtitlesformat": "json3/vtt",
+            "outtmpl": str(Path(temp_dir) / "%(id)s.%(ext)s"),
+            "socket_timeout": HTTP_TIMEOUT,
+            "extractor_args": {
+                "youtube": {"player_client": ["android", "ios", "tv_embedded", "web"]}
+            },
+        }
+        try:
+            with yt_dlp.YoutubeDL(options) as ydl:
+                ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+        except Exception as exc:
+            logger.warning("yt-dlp subtitle download failed for %s: %s", video_id, exc)
+            return ""
+        files = sorted(
+            Path(temp_dir).glob("*"),
+            key=lambda path: _language_rank(path.name),
+        )
+        for path in files:
+            try:
+                body = path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            text = _parse_caption_body(body, path.suffix.lstrip("."))
+            if text.strip():
+                return text
+    return ""
+
+
+def _language_rank(filename: str) -> int:
+    lowered = filename.lower()
+    for rank, language in enumerate(TRANSCRIPT_LANGUAGE_PRIORITY):
+        if f".{language.lower()}." in lowered:
+            return rank
+    return len(TRANSCRIPT_LANGUAGE_PRIORITY) + 1
+
+
+def _transcript_from_ytdlp(
+    video_id: str, captions: dict[str, Any] | None = None
+) -> str:
+    """Fallback: download yt-dlp caption tracks (json3/vtt) and parse them."""
+    entries = _ordered_caption_entries(captions)
+    if not entries:
+        try:
+            entries = _ordered_caption_entries(
+                _caption_tracks(_extract_info_with_clients(video_id))
+            )
+        except Exception as exc:
+            logger.warning("Targeted caption fetch failed for %s: %s", video_id, exc)
+            entries = []
+
+    for entry in entries[:6]:
+        body = _download_caption_track(str(entry.get("url") or ""))
+        text = _parse_caption_body(body, str(entry.get("ext") or ""))
+        if text.strip():
+            return text
+
+    # Everything above can be throttled from datacenter IPs: let yt-dlp fetch it.
+    return _subtitles_via_ytdlp(video_id)
+
+
+def fetch_transcript(video_id: str, captions: dict[str, Any] | None = None) -> str:
+    """Return the full timestamped transcript.
+
+    Primary: youtube-transcript-api. Fallback for datacenter IPs (where YouTube
+    blocks it): parse the yt-dlp caption tracks (json3/vtt), then run a targeted
+    yt-dlp extraction with android/ios/tv_embedded/web clients.
+    """
+    try:
+        text = _transcript_from_api(video_id)
+        if text.strip():
+            return text
+        logger.warning(
+            "youtube-transcript-api returned no text for %s; using yt-dlp captions",
+            video_id,
+        )
+    except Exception as exc:
+        logger.warning(
+            "youtube-transcript-api failed for %s (%s); using yt-dlp captions",
+            video_id,
+            exc,
+        )
+    return _transcript_from_ytdlp(video_id, captions)
 
 
 def fetch_comments(video_url: str, limit: int | None = None) -> list[dict[str, Any]]:
@@ -431,6 +719,9 @@ class ChannelItem:
     # Filled by the cloud batch runner (channel mode keeps them empty locally).
     transcript: str = ""
     comments: list[dict[str, Any]] = field(default_factory=list)
+    captions: dict[str, Any] = field(default_factory=dict)
+    thumbnail_url: str = ""
+    thumbnail_file: str = ""
 
 
 @dataclass
@@ -939,6 +1230,11 @@ def fetch_channel_listing(
     return info, entries
 
 
+def thumbnail_url_for(video_id: str) -> str:
+    """Best-effort thumbnail URL for a video id (caller should fall back on 404)."""
+    return f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg"
+
+
 def build_channel_item(
     source: dict[str, Any],
     kind: str,
@@ -946,6 +1242,7 @@ def build_channel_item(
     own_handles: tuple[str, ...] = (),
     collaboration_source: dict[str, Any] | None = None,
     video_id: str | None = None,
+    captions: dict[str, Any] | None = None,
 ) -> ChannelItem:
     """Build one ChannelItem row from yt-dlp info (or a flat playlist entry)."""
     resolved_id = str(video_id or source.get("id") or "")
@@ -974,6 +1271,8 @@ def build_channel_item(
             own_handles=own_handles,
         ),
         description=description,
+        captions=captions or {},
+        thumbnail_url=str(source.get("thumbnail") or thumbnail_url_for(resolved_id)),
     )
 
 
@@ -1008,6 +1307,7 @@ def fetch_items_with_details(
                     own_handles=own_handles,
                     collaboration_source=source if info else None,
                     video_id=video_id,
+                    captions=_caption_tracks(source if info else None),
                 )
             )
             label_title = str(source.get("title") or "Untitled")
@@ -1658,8 +1958,8 @@ def scrape_video(
     )
 
     try:
-        note("Fetching transcript (hi / en / en-IN preferred)")
-        transcript = fetch_transcript(video_id)
+        note("Fetching transcript (hi / en / en-IN / en-US / en-GB, yt-dlp fallback)")
+        transcript = fetch_transcript(video_id, _caption_tracks(info))
         note(f"Transcript lines: {len([line for line in transcript.splitlines() if line])}")
     except Exception as exc:  # transcripts are best-effort, never fatal
         logger.warning("Transcript unavailable for %s: %s", video_id, exc)
@@ -1863,6 +2163,10 @@ async def handle_youtube_link(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     channels, videos = extract_batch_links(message.text)
     if len(channels) + len(videos) >= 2:
+        await _handle_cloud_batch(message, channels, videos)
+        return
+
+    if cloud_single_links_enabled() and (channels or videos):
         await _handle_cloud_batch(message, channels, videos)
         return
 
@@ -2181,7 +2485,11 @@ async def _handle_cloud_batch(
     card.set_state("☁️ Dispatching to GitHub Actions…")
     await live.edit(force=True)
 
-    ok, detail = await asyncio.to_thread(dispatch_github_batch, links, message.chat_id)
+    ok, detail = await asyncio.to_thread(
+        dispatch_github_batch,
+        links,
+        message.chat_id or telegram_chat_id(),
+    )
     card.add_trace(detail)
     if ok:
         card.finish_step(2)
@@ -2220,6 +2528,71 @@ async def cmd_batch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Render.com health endpoint + cloud routing
+# --------------------------------------------------------------------------- #
+def health_port() -> int:
+    try:
+        return int(os.getenv("PORT") or "10000")
+    except ValueError:
+        return 10000
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    """Minimal 200 OK endpoint so Render Web Service + UptimeRobot stay happy."""
+
+    server_version = "YTBotHealth/1.0"
+
+    def _ok(self, send_body: bool = True) -> None:
+        payload = json.dumps({"status": "alive"}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if send_body:
+            self.wfile.write(payload)
+
+    def do_GET(self) -> None:  # noqa: N802 - http.server API
+        if self.path.split("?")[0] in ("/", "/health", "/ping"):
+            self._ok()
+        else:
+            self.send_error(404)
+
+    def do_HEAD(self) -> None:  # noqa: N802 - http.server API
+        if self.path.split("?")[0] in ("/", "/health", "/ping"):
+            self._ok(send_body=False)
+        else:
+            self.send_error(404)
+
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+        logger.debug("health: " + format, *args)
+
+
+def start_health_server(port: int | None = None) -> ThreadingHTTPServer:
+    """Start the health endpoint in a daemon thread (Render injects $PORT)."""
+    server = ThreadingHTTPServer(("0.0.0.0", port or health_port()), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, name="health-server", daemon=True)
+    thread.start()
+    return server
+
+
+def cloud_single_links_enabled() -> bool:
+    """Route single links to GitHub Actions too (default: on when hosted on Render)."""
+    raw = (os.getenv("CLOUD_SINGLE_LINKS") or "").strip().lower()
+    if raw:
+        return raw in {"1", "true", "yes", "on"}
+    return bool(
+        os.getenv("RENDER")
+        or os.getenv("RENDER_SERVICE_ID")
+        or os.getenv("RENDER_EXTERNAL_URL")
+    )
+
+
+def telegram_chat_id() -> str:
+    return (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
+
+
+# --------------------------------------------------------------------------- #
 # Startup
 # --------------------------------------------------------------------------- #
 def load_token() -> str:
@@ -2249,6 +2622,14 @@ def load_token() -> str:
 def main() -> None:
     token = load_token()
 
+    port = health_port()
+    health_server: ThreadingHTTPServer | None = None
+    try:
+        health_server = start_health_server(port)
+        print(f"[YT-Bot] Health server listening on 0.0.0.0:{port} (/, /health, /ping)")
+    except OSError as exc:  # port busy locally: polling should still work
+        logger.warning("Health server could not bind port %s: %s", port, exc)
+
     application = (
         Application.builder()
         .token(token)
@@ -2267,11 +2648,16 @@ def main() -> None:
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_youtube_link)
     )
 
+    single_mode = "cloud" if cloud_single_links_enabled() else "local"
     print(
-        "[YT-Bot] Running. Send a YouTube link, or /batch + channel links for the "
-        "cloud batch. Ctrl+C to stop."
+        f"[YT-Bot] Running ({single_mode} single-link mode). Send a YouTube link, or "
+        "/batch + links for the cloud batch. Ctrl+C to stop."
     )
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+    finally:
+        if health_server is not None:
+            health_server.shutdown()
 
 
 if __name__ == "__main__":
