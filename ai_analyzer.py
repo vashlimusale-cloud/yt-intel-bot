@@ -135,14 +135,21 @@ def _gemini_models() -> list[str]:
 
 
 def _gemini_request(
-    parts: list[dict[str, Any]], *, json_output: bool = False, temperature: float = 0.2
+    parts: list[dict[str, Any]],
+    *,
+    json_output: bool = False,
+    temperature: float = 0.2,
+    max_output_tokens: int = 2048,
 ) -> str:
     key = gemini_key()
     if not key:
         raise RuntimeError("GEMINI_API_KEY not set")
     payload: dict[str, Any] = {
         "contents": [{"parts": parts}],
-        "generationConfig": {"temperature": temperature, "maxOutputTokens": 2048},
+        "generationConfig": {
+            "temperature": temperature,
+            "maxOutputTokens": max_output_tokens,
+        },
     }
     if json_output:
         payload["generationConfig"]["responseMimeType"] = "application/json"
@@ -263,6 +270,96 @@ def analyze_hook_and_pulse(
     except Exception as exc:
         logger.warning("Hook/Audience analysis skipped: %s", exc)
         return {"error": str(exc)[:200]}
+
+
+def analyze_youtube_url_direct(video_url: str) -> dict[str, Any]:
+    """Official Gemini video-URL fallback: transcript + hook + audience in one call.
+
+    No audio download: Gemini ingests the public YouTube URL directly via
+    ``file_data`` (file_uri) and returns timestamped transcript lines plus the
+    hook/audience analysis in a single ~5 second request.
+    """
+    if not available():
+        return {}
+    prompt = (
+        "Watch this YouTube video and return ONLY JSON with keys: "
+        '"transcript" (string of timestamped lines "[MM:SS] text" covering the full '
+        'spoken content), "hook" ({"type": "question|shock|promise|story|number|demo|other", '
+        '"analysis": "max 35 words", "strength": 1-10}), '
+        '"audience" ({"sentiment": "positive|mixed|negative", '
+        '"top_themes": ["theme1", "theme2", "theme3"], '
+        '"notable_insight": "max 30 words"}). '
+        "Do not summarise, no commentary, no markdown fences."
+    )
+    parts = [
+        {"text": prompt},
+        {"file_data": {"mime_type": "video/*", "file_uri": video_url}},
+    ]
+    payload = {
+        "contents": [{"parts": parts}],
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 8192,
+            "responseMimeType": "application/json",
+        },
+    }
+    key = gemini_key()
+    if not key:
+        return {}
+    last_error = ""
+    for model in _gemini_models()[:3]:
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model}:generateContent"
+        )
+        try:
+            response = requests.post(
+                url,
+                json=payload,
+                headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                timeout=150,
+            )
+        except Exception as exc:
+            last_error = f"{model}: {str(exc)[:120]}"
+            continue
+        if not response.ok:
+            last_error = f"{model}: HTTP {response.status_code} {response.text[:160]}"
+            continue
+        try:
+            data = response.json()
+        except ValueError:
+            last_error = f"{model}: invalid JSON response"
+            continue
+        candidates = data.get("candidates") or []
+        content = ""
+        if candidates:
+            content = "".join(
+                str(part.get("text") or "")
+                for part in (candidates[0].get("content") or {}).get("parts") or []
+            )
+        if not content.strip():
+            finish = candidates[0].get("finishReason") if candidates else "no candidates"
+            last_error = f"{model}: empty response ({finish})"
+            continue
+        parsed = _parse_json_block(content)
+        if not isinstance(parsed, dict):
+            last_error = f"{model}: unparseable JSON"
+            continue
+        transcript = parsed.get("transcript") or ""
+        if isinstance(transcript, list):
+            transcript = "\n".join(str(line) for line in transcript)
+        transcript = _ensure_timestamps(str(transcript)).strip()
+        result: dict[str, Any] = {
+            "transcript": transcript,
+            "provider": f"gemini-video-url:{model}",
+        }
+        if isinstance(parsed.get("hook"), dict):
+            result["hook"] = parsed["hook"]
+        if isinstance(parsed.get("audience"), dict):
+            result["audience"] = parsed["audience"]
+        return result
+    logger.warning("Gemini video-URL fallback failed for %s: %s", video_url, last_error)
+    return {}
 
 
 def analyze_videos_batch(videos: list[dict[str, Any]]) -> list[dict[str, Any]]:

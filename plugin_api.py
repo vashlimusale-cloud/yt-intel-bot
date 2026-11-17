@@ -242,14 +242,18 @@ def video_payload(url: str) -> dict[str, Any]:
     video_id = _video_id(url)
     watch_url = f"https://www.youtube.com/watch?v={video_id}"
     info = bot.fetch_metadata(watch_url)
-    blocked = bool(info.get("_fallback"))
+    blocked = False
     warnings = list(info.get("_warnings") or [])
 
     from concurrent.futures import ThreadPoolExecutor
 
-    def transcript_work() -> tuple[str, bool]:
+    def transcript_work() -> tuple[str, bool, dict[str, Any]]:
         text = bot.fetch_transcript(video_id, bot._caption_tracks(info))
         used = False
+        direct: dict[str, Any] = {}
+        if not text and ai_analyzer.available():
+            direct = ai_analyzer.analyze_youtube_url_direct(watch_url)
+            text = str(direct.get("transcript") or "")
         if (
             not text
             and ai_analyzer.audio_transcription_enabled()
@@ -257,7 +261,7 @@ def video_payload(url: str) -> dict[str, Any]:
         ):
             text = ai_analyzer.transcribe_video_audio(video_id)
             used = bool(text)
-        return text, used
+        return text, used, direct
 
     def channel_work() -> tuple[dict[str, Any], dict[str, Any] | None]:
         channel_info = recommender.resolve_channel(watch_url)
@@ -271,9 +275,9 @@ def video_payload(url: str) -> dict[str, Any]:
         comments_future = pool.submit(bot.fetch_comments, watch_url, MAX_COMMENTS)
         channel_future = pool.submit(channel_work)
         try:
-            transcript, audio_used = transcript_future.result()
+            transcript, audio_used, direct_ai = transcript_future.result()
         except Exception as exc:
-            transcript, audio_used = "", False
+            transcript, audio_used, direct_ai = "", False, {}
             warnings.append(f"transcript unavailable: {str(exc)[:120]}")
         try:
             comments = comments_future.result()
@@ -292,7 +296,6 @@ def video_payload(url: str) -> dict[str, Any]:
             if meta is None and channel.get("channel_url"):
                 warnings.append("channel deep extraction unavailable")
         except bot.DatacenterBlockError as exc:
-            blocked = True
             warnings.append(f"channel deep extraction blocked: {exc}")
             logger.warning("Plugin channel lookup blocked: %s", exc)
             try:
@@ -308,7 +311,19 @@ def video_payload(url: str) -> dict[str, Any]:
             warnings.append(f"channel metadata unavailable: {str(exc)[:120]}")
             logger.warning("Plugin channel lookup failed: %s", exc)
             channel_meta = {}
-    hook = ai_analyzer.analyze_hook_and_pulse(transcript, comments)
+    if direct_ai.get("hook") or direct_ai.get("audience"):
+        hook = {
+            "hook": direct_ai.get("hook", {}),
+            "audience": direct_ai.get("audience", {}),
+            "provider": direct_ai.get("provider", "gemini-video-url"),
+        }
+    else:
+        hook = ai_analyzer.analyze_hook_and_pulse(transcript, comments)
+    if info.get("view_count") is None and not transcript.strip():
+        blocked = True
+        warnings.append(
+            "missing view_count and transcript after all extraction passes"
+        )
 
     transcript_used = transcript[:MAX_TRANSCRIPT]
     return {

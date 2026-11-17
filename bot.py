@@ -27,6 +27,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from http.cookiejar import MozillaCookieJar
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
@@ -168,6 +169,31 @@ def apply_cookies(options: dict[str, Any]) -> dict[str, Any]:
     return options
 
 
+def get_cookie_session() -> requests.Session | None:
+    """requests.Session loaded with the decoded YouTube cookies (or None)."""
+    cookie_file = get_cookie_file()
+    if not cookie_file:
+        return None
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": USER_AGENT,
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                "image/avif,image/webp,*/*;q=0.8"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+    )
+    try:
+        jar = MozillaCookieJar(cookie_file)
+        jar.load(ignore_discard=True, ignore_expires=True)
+        session.cookies.update(jar)
+    except Exception as exc:
+        logger.warning("Could not load cookies into requests session: %s", exc)
+    return session
+
+
 # --------------------------------------------------------------------------- #
 # Small formatting helpers
 # --------------------------------------------------------------------------- #
@@ -277,7 +303,11 @@ def _client_extractor_args(
 
 
 def _resilient_opts(
-    *, flat: bool = False, playlistend: int | None = None
+    *,
+    flat: bool = False,
+    playlistend: int | None = None,
+    clients: list[str] | None = None,
+    with_cookies: bool = True,
 ) -> dict[str, Any]:
     options: dict[str, Any] = {
         "quiet": True,
@@ -285,7 +315,7 @@ def _resilient_opts(
         "skip_download": True,
         "socket_timeout": HTTP_TIMEOUT,
         "retries": 2,
-        "extractor_args": _client_extractor_args(),
+        "extractor_args": _client_extractor_args(clients),
     }
     if flat:
         options["extract_flat"] = "in_playlist"
@@ -293,7 +323,7 @@ def _resilient_opts(
         options["noplaylist"] = True
     if playlistend:
         options["playlistend"] = playlistend
-    return apply_cookies(options)
+    return apply_cookies(options) if with_cookies else options
 
 
 def _youtube_json_after(html_text: str, marker: str) -> dict[str, Any] | None:
@@ -330,24 +360,72 @@ def _og_meta(html_text: str) -> dict[str, str]:
     return meta
 
 
+def _watch_page_player(
+    video_id: str, session: requests.Session | None = None
+) -> tuple[str, dict[str, Any], str, requests.Session | None]:
+    """Fetch the watch page (cookie session when available) and its player JSON."""
+    session = session or get_cookie_session()
+    if session is None:
+        session = requests.Session()
+        session.headers.update(
+            {
+                "User-Agent": USER_AGENT,
+                "Accept-Language": "en-US,en;q=0.9",
+            }
+        )
+    watch_url = f"https://www.youtube.com/watch?v={video_id}"
+    try:
+        response = session.get(watch_url, timeout=HTTP_TIMEOUT)
+    except Exception as exc:
+        return "", {}, f"watch page failed: {str(exc)[:120]}", session
+    if not response.ok:
+        return "", {}, f"watch page HTTP {response.status_code}", session
+    player = _youtube_json_after(response.text, "ytInitialPlayerResponse") or {}
+    return response.text, player, "", session
+
+
+def _int_or_none(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+        return parsed if parsed > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _caption_tracks_from_player(player: dict[str, Any]) -> list[dict[str, Any]]:
+    renderer = (
+        (player.get("captions") or {}).get("playerCaptionsTracklistRenderer") or {}
+    )
+    tracks = renderer.get("captionTracks") or []
+    return [track for track in tracks if isinstance(track, dict) and track.get("baseUrl")]
+
+
 def _video_info_from_page(
     video_id: str, url: str, reason: str = ""
 ) -> dict[str, Any]:
-    """Zero-fail metadata via oEmbed + watch-page HTML/OpenGraph/playerResponse."""
+    """Zero-fail metadata via oEmbed + authenticated watch-page player response."""
     watch_url = f"https://www.youtube.com/watch?v={video_id}"
     warnings: list[str] = [
-        "yt-dlp player response blocked (datacenter IP); used oEmbed + page HTML fallback"
+        "yt-dlp player response blocked (datacenter IP); used oEmbed + watch-page HTML fallback"
     ]
     if reason:
         warnings.append(f"yt-dlp said: {reason[:160]}")
+    session = get_cookie_session()
     oembed: dict[str, Any] = {}
     try:
-        response = requests.get(
-            "https://www.youtube.com/oembed",
-            params={"url": watch_url, "format": "json"},
-            headers={"User-Agent": USER_AGENT},
-            timeout=HTTP_TIMEOUT,
-        )
+        if session is not None:
+            response = session.get(
+                "https://www.youtube.com/oembed",
+                params={"url": watch_url, "format": "json"},
+                timeout=HTTP_TIMEOUT,
+            )
+        else:
+            response = requests.get(
+                "https://www.youtube.com/oembed",
+                params={"url": watch_url, "format": "json"},
+                headers={"User-Agent": USER_AGENT},
+                timeout=HTTP_TIMEOUT,
+            )
         if response.ok:
             oembed = response.json()
         else:
@@ -355,23 +433,10 @@ def _video_info_from_page(
     except Exception as exc:
         warnings.append(f"oEmbed failed: {str(exc)[:100]}")
 
-    html_text = ""
-    try:
-        response = requests.get(
-            watch_url,
-            headers={"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"},
-            timeout=HTTP_TIMEOUT,
-        )
-        if response.ok:
-            html_text = response.text
-        else:
-            warnings.append(f"watch page HTTP {response.status_code}")
-    except Exception as exc:
-        warnings.append(f"watch page failed: {str(exc)[:100]}")
-
+    html_text, player, page_error, _session = _watch_page_player(video_id, session)
+    if page_error:
+        warnings.append(page_error)
     og = _og_meta(html_text) if html_text else {}
-    player = _youtube_json_after(html_text, "ytInitialPlayerResponse") if html_text else None
-    player = player or {}
     details = player.get("videoDetails") or {}
     micro = (
         (player.get("microformat") or {}).get("playerMicroformatRenderer") or {}
@@ -383,10 +448,7 @@ def _video_info_from_page(
         raise DatacenterBlockError(
             "Failed to extract any player response and HTML fallback had no title"
         )
-    thumbnails = (
-        (details.get("thumbnail") or {}).get("thumbnails")
-        or []
-    )
+    thumbnails = (details.get("thumbnail") or {}).get("thumbnails") or []
     thumbnail = str(
         oembed.get("thumbnail_url")
         or og.get("og:image")
@@ -397,7 +459,15 @@ def _video_info_from_page(
     if isinstance(raw_keywords, str):
         raw_keywords = [part for part in raw_keywords.split(",") if part]
     channel_id = str(details.get("channelId") or micro.get("externalChannelId") or "")
-    publish_date = str(micro.get("publishDate") or "")
+    publish_date = str(
+        micro.get("publishDate") or details.get("uploadDate") or ""
+    ).split("T")[0]
+    caption_tracks = _caption_tracks_from_player(player)
+    like_count = _int_or_none(
+        details.get("likeCount")
+        or micro.get("likeCount")
+        or (micro.get("likeCount") if isinstance(micro, dict) else None)
+    )
     info: dict[str, Any] = {
         "id": video_id,
         "_type": "video",
@@ -410,9 +480,7 @@ def _video_info_from_page(
             or micro.get("ownerChannelName")
             or ""
         ),
-        "uploader": str(
-            details.get("author") or oembed.get("author_name") or ""
-        ),
+        "uploader": str(details.get("author") or oembed.get("author_name") or ""),
         "channel_id": channel_id,
         "channel_url": (
             f"https://www.youtube.com/channel/{channel_id}"
@@ -422,8 +490,9 @@ def _video_info_from_page(
         "description": str(
             details.get("shortDescription") or og.get("og:description") or ""
         ),
-        "duration": int(details.get("lengthSeconds") or 0) or None,
-        "view_count": int(details.get("viewCount") or 0) or None,
+        "duration": _int_or_none(details.get("lengthSeconds")),
+        "view_count": _int_or_none(details.get("viewCount")),
+        "like_count": like_count,
         "tags": [str(tag) for tag in raw_keywords],
         "categories": (
             [str(micro.get("category"))] if micro.get("category") else []
@@ -436,8 +505,63 @@ def _video_info_from_page(
         "_fallback": True,
         "_warnings": warnings,
         "_blocked_reason": reason,
+        "_caption_tracks_list": [
+            {
+                "url": str(track.get("baseUrl") or ""),
+                "languageCode": str(track.get("languageCode") or ""),
+                "kind": str(track.get("kind") or ""),
+            }
+            for track in caption_tracks
+        ],
     }
     return info
+
+
+def _captions_from_watch_page(video_id: str) -> str:
+    """Pass C: fetch captionTracks[].baseUrl directly from the player JSON."""
+    session = get_cookie_session()
+    if session is None:
+        return ""
+    _html, player, error, _session = _watch_page_player(video_id, session)
+    if error or not player:
+        return ""
+    tracks = _caption_tracks_from_player(player)
+    if not tracks:
+        return ""
+
+    def language_rank(track: dict[str, Any]) -> int:
+        language = str(track.get("languageCode") or "")
+        try:
+            return PREFERRED_LANGUAGES.index(language)
+        except ValueError:
+            return len(PREFERRED_LANGUAGES) + 1
+
+    for track in sorted(tracks, key=language_rank):
+        base_url = str(track.get("baseUrl") or "")
+        if not base_url:
+            continue
+        url = base_url if "fmt=" in base_url else f"{base_url}&fmt=json3"
+        try:
+            response = session.get(url, timeout=HTTP_TIMEOUT)
+        except Exception as exc:
+            logger.warning("Caption track fetch failed for %s: %s", video_id, exc)
+            continue
+        if not response.ok:
+            continue
+        try:
+            payload = response.json()
+        except ValueError:
+            continue
+        cues = _parse_json3_captions(payload)
+        lines = [
+            f"[{_fmt_timestamp(start)}] {text}"
+            for start, text in cues
+            if text.strip()
+        ]
+        if lines:
+            logger.info("Captions recovered from watch page for %s (%d lines)", video_id, len(lines))
+            return "\n".join(lines)
+    return ""
 
 
 def _channel_info_from_page(channel_url: str, reason: str = "") -> dict[str, Any]:
@@ -494,19 +618,32 @@ def extract_yt_info_resilient(
     produce a title (i.e. the URL is genuinely blocked or invalid).
     """
     last_error = ""
-    try:
-        with yt_dlp.YoutubeDL(_resilient_opts(flat=flat, playlistend=playlistend)) as ydl:
-            info = ydl.extract_info(url, download=False)
-        if isinstance(info, dict):
-            entries = [entry for entry in (info.get("entries") or []) if entry]
-            if info.get("title") or entries:
-                return info
-            last_error = "yt-dlp returned an empty result"
-        else:
-            last_error = "yt-dlp returned a non-dict result"
-    except Exception as exc:
-        last_error = str(exc)
-        logger.warning("Resilient yt-dlp extraction failed for %s: %s", url, exc)
+    attempts = (
+        ("A", ["android_vr", "ios", "tv_embedded"], False),
+        ("B", ["tv_embedded", "mweb", "web"], True),
+    )
+    for label, clients, use_cookies in attempts:
+        try:
+            with yt_dlp.YoutubeDL(
+                _resilient_opts(
+                    flat=flat,
+                    playlistend=playlistend,
+                    clients=clients,
+                    with_cookies=use_cookies,
+                )
+            ) as ydl:
+                info = ydl.extract_info(url, download=False)
+            if isinstance(info, dict):
+                entries = [entry for entry in (info.get("entries") or []) if entry]
+                if info.get("title") or entries:
+                    info["_extraction_pass"] = label
+                    return info
+                last_error = f"pass {label}: yt-dlp returned an empty result"
+            else:
+                last_error = f"pass {label}: yt-dlp returned a non-dict result"
+        except Exception as exc:
+            last_error = f"pass {label}: {str(exc)[:200]}"
+            logger.warning("yt-dlp pass %s failed for %s: %s", label, url, exc)
 
     video_id = extract_video_id(url)
     if video_id:
@@ -577,8 +714,13 @@ def _caption_tracks(info: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def _transcript_from_api(video_id: str) -> str:
-    """Primary extractor: youtube-transcript-api (v1.2 instance API or legacy)."""
-    api = YouTubeTranscriptApi()
+    """Primary extractor: youtube-transcript-api with the cookie HTTP session."""
+    session = get_cookie_session()
+    api = (
+        YouTubeTranscriptApi(http_client=session)
+        if session is not None
+        else YouTubeTranscriptApi()
+    )
     if hasattr(api, "list"):  # youtube-transcript-api >= 1.2 (instance API)
         transcript_list = api.list(video_id)
     else:  # older releases expose class/static helpers
@@ -886,7 +1028,17 @@ def fetch_transcript(video_id: str, captions: dict[str, Any] | None = None) -> s
             video_id,
             exc,
         )
-    return _transcript_from_ytdlp(video_id, captions)
+    text = _transcript_from_ytdlp(video_id, captions)
+    if text.strip():
+        return text
+    # Pass C: parse captionTracks[].baseUrl straight from the watch page.
+    try:
+        watch_captions = _captions_from_watch_page(video_id)
+        if watch_captions.strip():
+            return watch_captions
+    except Exception as exc:
+        logger.warning("Watch-page caption parser failed for %s: %s", video_id, exc)
+    return ""
 
 
 def fetch_comments(video_url: str, limit: int | None = None) -> list[dict[str, Any]]:
@@ -896,6 +1048,13 @@ def fetch_comments(video_url: str, limit: int | None = None) -> list[dict[str, A
     """
     cap = MAX_COMMENTS if limit is None else limit
     downloader = YoutubeCommentDownloader()
+    cookie_session = get_cookie_session()
+    if cookie_session is not None:
+        try:
+            downloader.session.cookies.update(cookie_session.cookies)
+            downloader.session.headers.update(cookie_session.headers)
+        except Exception as exc:
+            logger.warning("Could not pass cookies to comment downloader: %s", exc)
     comments: list[dict[str, Any]] = []
     for comment in downloader.get_comments_from_url(video_url, sort_by=SORT_BY_POPULAR):
         comments.append(comment)
@@ -1601,6 +1760,31 @@ def channel_banner_url(listing: dict[str, Any], about_data: dict[str, Any] | Non
         if is_banner and width >= best_width and url:
             best_url, best_width = url, width
     return _upgrade_banner_url(best_url)
+
+
+def create_banner_from_avatar(avatar_path: Path, dest: Path) -> Path | None:
+    """Generate a 1280x720 banner from the channel avatar when no banner exists."""
+    try:
+        from PIL import Image, ImageFilter
+
+        with Image.open(avatar_path) as source:
+            image = source.convert("RGB")
+            background = image.resize((1280, 720)).filter(ImageFilter.GaussianBlur(42))
+            background = Image.blend(
+                background, Image.new("RGB", (1280, 720), (12, 14, 20)), 0.55
+            )
+            avatar = image.copy()
+            avatar.thumbnail((420, 420))
+            background.paste(
+                avatar,
+                ((1280 - avatar.width) // 2, (720 - avatar.height) // 2),
+            )
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            background.save(dest, "JPEG", quality=92)
+        return dest
+    except Exception as exc:
+        logger.warning("Could not generate fallback banner: %s", exc)
+        return None
 
 
 def download_channel_banner(url: str, dest: Path) -> Path | None:
@@ -3384,9 +3568,17 @@ def build_smart_video_bundle(
         )
         return info, item, thumb_path
 
-    def transcript_task() -> tuple[str, bool]:
+    def transcript_task() -> tuple[str, bool, dict[str, Any]]:
         transcript = fetch_transcript(video_id)
         audio_used = False
+        direct_ai: dict[str, Any] = {}
+        if not transcript.strip() and ai_analyzer.available():
+            note("Captions empty — Gemini direct video-URL fallback")
+            try:
+                direct_ai = ai_analyzer.analyze_youtube_url_direct(watch_url)
+            except Exception as exc:
+                logger.warning("Gemini video-URL fallback failed: %s", exc)
+            transcript = str(direct_ai.get("transcript") or "")
         if (
             not transcript.strip()
             and ai_analyzer.audio_transcription_enabled()
@@ -3395,7 +3587,7 @@ def build_smart_video_bundle(
             note("No captions — Gemini audio transcription backup (enabled)")
             transcript = ai_analyzer.transcribe_video_audio(video_id)
             audio_used = bool(transcript)
-        return transcript, audio_used
+        return transcript, audio_used, direct_ai
 
     def comments_task() -> list[dict[str, Any]]:
         limit = int(os.getenv("MAX_SMART_COMMENTS") or MAX_SMART_COMMENTS)
@@ -3430,6 +3622,14 @@ def build_smart_video_bundle(
             banner_target = download_channel_banner(
                 banner_url, OUTPUT_DIR / f"{channel_stem}_banner.jpg"
             )
+            if banner_target is None and avatar_src:
+                banner_target = create_banner_from_avatar(
+                    avatar_src, OUTPUT_DIR / f"{channel_stem}_banner.jpg"
+                )
+                if banner_target is not None:
+                    result["warnings"].append(
+                        "channel has no banner image; generated one from the DP"
+                    )
             if banner_target is not None:
                 result["banner_file"] = banner_target.name
             if listing.get("_fallback"):
@@ -3497,7 +3697,7 @@ def build_smart_video_bundle(
     if "metadata" in errors:
         raise errors["metadata"]
     info, item, thumb_path = results["metadata"]
-    transcript, audio_used = results.get("transcript") or ("", False)
+    transcript, audio_used, direct_ai = results.get("transcript") or ("", False, {})
     item.transcript = transcript
     item.comments = results.get("comments") or []
     channel_result = results.get("channel") or {}
@@ -3505,10 +3705,14 @@ def build_smart_video_bundle(
     avatar_file = channel_result.get("avatar_file") or ""
     banner_file = channel_result.get("banner_file") or ""
     channel_url = channel_result.get("channel_url") or ""
-    blocked = bool(info.get("_fallback"))
+    blocked = False
     warnings = list(info.get("_warnings") or [])
-    if channel_result.get("blocked"):
+    if item.views is None and not transcript.strip():
         blocked = True
+        warnings.append(
+            "missing view_count and transcript after all extraction passes"
+        )
+    if channel_result.get("blocked"):
         warnings.extend(channel_result.get("warnings") or [])
     viral = results.get("viral") or {
         "channel": {},
@@ -3520,23 +3724,27 @@ def build_smart_video_bundle(
         "error": str(errors.get("similar", ""))[:160],
     }
     if viral.get("blocked"):
-        blocked = True
         warnings.append(f"viral listing blocked: {str(viral.get('error'))[:160]}")
     if similar.get("blocked"):
-        blocked = True
         warnings.append(f"similar search blocked: {str(similar.get('error'))[:160]}")
     if errors.get("transcript") and is_datacenter_block(errors["transcript"]):
-        blocked = True
         warnings.append(f"transcript blocked: {str(errors['transcript'])[:160]}")
     if errors.get("comments"):
         warnings.append(f"comments unavailable: {str(errors['comments'])[:120]}")
 
     note("Gemini Hook Analysis + Audience Pulse")
-    hook = (
-        ai_analyzer.analyze_hook_and_pulse(transcript, item.comments)
-        if ai_analyzer.available()
-        else {"skipped": True, "reason": "no AI key"}
-    )
+    if direct_ai.get("hook") or direct_ai.get("audience"):
+        hook = {
+            "hook": direct_ai.get("hook", {}),
+            "audience": direct_ai.get("audience", {}),
+            "provider": direct_ai.get("provider", "gemini-video-url"),
+        }
+    else:
+        hook = (
+            ai_analyzer.analyze_hook_and_pulse(transcript, item.comments)
+            if ai_analyzer.available()
+            else {"skipped": True, "reason": "no AI key"}
+        )
 
     markdown_path = OUTPUT_DIR / f"{safe_stem(item.title, 'Video')}_{video_id}_Intel.md"
     markdown_path.write_text(

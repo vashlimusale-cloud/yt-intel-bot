@@ -184,6 +184,17 @@ Reply messages include an inline `⚙️ Switch Engine` button, plus
 
 ## Speed, cookies & audio gate
 
+- **Dual-pass datacenter extraction**: Pass A uses cookieless `android_vr/ios/
+  tv_embedded` (PO-token bypass), Pass B uses cookie-authenticated
+  `tv_embedded/mweb/web`. Pass C parses the watch page's
+  `ytInitialPlayerResponse` (view count, duration, likes, publish date, caption
+  tracks) and can pull `[MM:SS]` captions straight from `captionTracks[0].baseUrl`.
+- **Cookie-authenticated transcripts/comments**: the decoded cookie session is
+  passed to `YouTubeTranscriptApi(http_client=session)` and into
+  `youtube-comment-downloader`, so both survive Render's datacenter IP.
+- **Gemini direct-URL fallback**: if captions are still empty, Gemini ingests the
+  public YouTube URL (`file_data.file_uri`) and returns the timestamped
+  transcript + Hook Analysis + Audience Pulse in one request — no audio download.
 - **Cookie-authenticated yt-dlp**: set `YOUTUBE_COOKIES_B64` (base64 Netscape
   cookie export) and the bot decodes it to `<tmp>/yt_cookies.txt`, passing
   `cookiefile` to every yt-dlp call (metadata, channel listing, caption
