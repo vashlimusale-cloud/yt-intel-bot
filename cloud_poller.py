@@ -92,7 +92,7 @@ def main() -> int:
 
     token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
     repo = (os.getenv("GITHUB_REPO") or os.getenv("GITHUB_REPOSITORY") or "").strip()
-    dispatch_token = (os.getenv("GITHUB_PAT") or os.getenv("GITHUB_TOKEN") or "").strip()
+    dispatch_token = (os.getenv("GH_PAT") or os.getenv("GITHUB_PAT") or os.getenv("GITHUB_TOKEN") or "").strip()
     if not token or not repo or not dispatch_token:
         logger.error("TELEGRAM_BOT_TOKEN, GITHUB_REPO and a GitHub token are required")
         return 2
